@@ -1,0 +1,127 @@
+{
+  "format": 1,
+  "title": {
+    "en": "feng5124 DSH plugins",
+    "zh": "feng5124 的 DSH 插件"
+  },
+  "description": {
+    "en": "Community plugins for DeepSeek Harness: smart mail with whitelist wake, and a headless-sessions sidebar panel.",
+    "zh": "DeepSeek Harness 社区插件：智能邮箱（白名单唤醒）与无头会话侧栏面板。"
+  },
+  "metadata": {
+    "categories": {
+      "mail": {
+        "title": {
+          "en": "Mail",
+          "zh": "邮件"
+        }
+      },
+      "sessions": {
+        "title": {
+          "en": "Sessions",
+          "zh": "会话"
+        }
+      }
+    },
+    "labels": {
+      "automation": {
+        "title": {
+          "en": "Automation",
+          "zh": "自动化"
+        }
+      },
+      "webui": {
+        "title": {
+          "en": "Web panel",
+          "zh": "网页面板"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-smart-mail",
+      "title": {
+        "en": "Smart Mail",
+        "zh": "智能邮箱"
+      },
+      "description": {
+        "en": "Multi-account IMAP/SMTP send & read tools plus whitelist-only headless wake on new mail (QQ/163/Gmail/Outlook presets, custom servers, authorization-code auth).",
+        "zh": "多账号邮件收发工具 + 白名单新邮件无头唤醒（QQ/163/Gmail/Outlook 预设、自定义服务器、授权码认证）。"
+      },
+      "author": "feng5124",
+      "homepage": "https://github.com/feng5124/dsh-plugins/tree/main/packages/dsh-smart-mail#readme",
+      "repository": {
+        "url": "https://github.com/feng5124/dsh-plugins",
+        "directory": "packages/dsh-smart-mail"
+      },
+      "metadata": {
+        "category": "mail",
+        "keywords": [
+          "email",
+          "imap",
+          "smtp",
+          "wake",
+          "automation"
+        ],
+        "labels": [
+          "automation",
+          "webui"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1792890187,
+          "source": {
+            "type": "npm"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-plugin-headless-sessions-panel",
+      "title": {
+        "en": "Headless Sessions Panel",
+        "zh": "无头会话面板"
+      },
+      "description": {
+        "en": "Sidebar panel that lists running/recent headless DSH sessions and exports each as readable Markdown, with open-into-workspace actions.",
+        "zh": "侧栏面板：列出本机正在运行/最近的无头 DSH 会话，导出可读 Markdown 预览，并可打开进主视图。"
+      },
+      "author": "feng5124",
+      "homepage": "https://github.com/feng5124/dsh-plugins/tree/main/packages/dsh-plugin-headless-sessions-panel#readme",
+      "repository": {
+        "url": "https://github.com/feng5124/dsh-plugins",
+        "directory": "packages/dsh-plugin-headless-sessions-panel"
+      },
+      "metadata": {
+        "category": "sessions",
+        "keywords": [
+          "headless",
+          "sessions",
+          "panel",
+          "forensics"
+        ],
+        "labels": [
+          "webui"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishTimestamp": 1792890228,
+          "source": {
+            "type": "npm"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    }
+  ]
+}
