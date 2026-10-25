@@ -18,10 +18,15 @@ const server = net.createServer((socket) => {
     }
     if (text.includes('SEARCH')) { socket.write('* SEARCH 100 101 102\r\nA0003 OK SEARCH done\r\n'); return }
     if (text.includes('FETCH')) {
+      // RFC 3501 ENVELOPE = (date subject from sender reply-to to cc bcc
+      // in-reply-to message-id): the subject is the SECOND field and CJK
+      // subjects arrive as an IMAP literal. The old fixture here put the
+      // address list in the subject slot, which stopped matching the parser
+      // after the 2026-10-24 NetEase subject fix.
       const payload = Buffer.concat([
-        Buffer.from('* 1 FETCH (UID 102 ENVELOPE ("Mon, 24 Oct 2026 10:00:00 +0800" (("Sender" NIL "boss" "company.com")) NIL NIL NIL NIL NIL ', 'utf8'),
+        Buffer.from('* 1 FETCH (UID 102 ENVELOPE ("Mon, 24 Oct 2026 10:00:00 +0800" ', 'utf8'),
         Buffer.from(`{${subject.length}}\r\n`, 'utf8'), subject,
-        Buffer.from(') BODY[TEXT]<0> ', 'utf8'),
+        Buffer.from(' (("Sender" NIL "boss" "company.com")) NIL NIL NIL NIL NIL NIL "<msg-102@company.com>") BODY[TEXT]<0> ', 'utf8'),
         Buffer.from(`{${body.length}}\r\n`, 'utf8'), body,
         Buffer.from(')\r\nA0004 OK FETCH done\r\n', 'utf8'),
       ])
