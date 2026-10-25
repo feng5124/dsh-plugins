@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Smart Mail",
+    "description": "Multi-account IMAP/SMTP mail with send/read tools and whitelist-only headless wake on new mail."
+  }
+}

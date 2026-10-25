@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "智能邮箱",
+    "description": "多账号邮件收发（send_email / read_emails 工具）+ 白名单新邮件唤醒无头 DSH 会话；内置 QQ/163/Gmail/Outlook 预设，支持自定义 IMAP/SMTP 与授权码登录。"
+  }
+}

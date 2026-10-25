@@ -1,0 +1,22 @@
+# dsh-plugin-headless-sessions-panel bundle patch.
+#
+# The host half (lib/host.mjs) registers two routes on DSH's own web server:
+#   GET /headless-sessions/status[?all=1]    -> running/recent headless sessions
+#   GET /headless-sessions/dump?id=<prefix>  -> one session as readable Markdown
+# The browser half (lib/client.js) polls those routes and renders the panel. This
+# Loader entry is what makes both halves part of the composition.
+#
+# The entry uses the plain package specifier: a profile-installed bundle resolves
+# through `package.json#main` (lib/host.mjs). Two loader limits learned while
+# installing this package:
+#   * a subpath specifier of a profile-installed package does not resolve here
+#     (`dsh-plugin-headless-sessions-panel/host` -> "failed to import"), so the
+#     host code hangs off `main` instead of its own export;
+#   * a specifier's already-imported module URL is not re-executed, so editing the
+#     host half requires a fresh process (or a rename that yields a new specifier).
+#
+# Applied after dsh-base and dsh-web-app, so `webServer` and the sidebar/main
+# seats it uses already exist.
+- insert:
+    - id: headless-sessions
+      name: 'dsh-plugin-headless-sessions-panel'

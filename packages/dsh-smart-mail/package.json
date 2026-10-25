@@ -1,0 +1,64 @@
+{
+  "name": "dsh-smart-mail",
+  "version": "0.1.0",
+  "description": "Smart mail for DSH: multi-account IMAP/SMTP send & read tools plus whitelist-only headless wake on new mail (QQ/163/Gmail/Outlook presets, custom servers, authorization-code auth).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./smtp.mjs": "./smtp.mjs",
+    "./imap.mjs": "./imap.mjs",
+    "./store.mjs": "./store.mjs",
+    "./wake.mjs": "./wake.mjs",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "smtp.mjs",
+    "imap.mjs",
+    "store.mjs",
+    "wake.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "email",
+    "mail",
+    "imap",
+    "smtp",
+    "automation"
+  ],
+  "author": {
+    "name": "feng5124",
+    "url": "https://github.com/feng5124"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/feng5124/dsh-plugins.git",
+    "directory": "packages/dsh-smart-mail"
+  },
+  "homepage": "https://github.com/feng5124/dsh-plugins/tree/main/packages/dsh-smart-mail#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

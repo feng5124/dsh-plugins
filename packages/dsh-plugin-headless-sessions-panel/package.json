@@ -1,0 +1,54 @@
+{
+  "name": "dsh-plugin-headless-sessions-panel",
+  "version": "1.0.0",
+  "description": "Sidebar headless-sessions panel for DSH: lists running/recent headless sessions and exports each as readable Markdown, with open-into-workspace actions.",
+  "type": "module",
+  "main": "lib/host.mjs",
+  "exports": {
+    ".": "./lib/host.mjs",
+    "./host": "./lib/host.mjs",
+    "./host.mjs": "./lib/host.mjs",
+    "./lib/host.mjs": "./lib/host.mjs",
+    "./find-headless": "./lib/find-headless.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "headless",
+    "sessions",
+    "panel",
+    "forensics"
+  ],
+  "author": {
+    "name": "feng5124",
+    "url": "https://github.com/feng5124"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/feng5124/dsh-plugins.git",
+    "directory": "packages/dsh-plugin-headless-sessions-panel"
+  },
+  "homepage": "https://github.com/feng5124/dsh-plugins/tree/main/packages/dsh-plugin-headless-sessions-panel#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
