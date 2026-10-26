@@ -50,13 +50,22 @@ function createReader(socket) {
       if (outcome === null) return
       waiters.shift()
       clearTimeout(waiter.timer)
+      // Drop the bytes this command consumed. Compaction happens only here,
+      // between commands: `pending.end` is an absolute index into `buf`, so
+      // re-basing the buffer mid-command (while a literal is still arriving)
+      // would shift every index and corrupt the next literal's start — that is
+      // exactly how messages with large bodies used to be lost.
+      state.buf = state.buf.subarray(state.pos)
+      state.pos = 0
+      state.pending = null
       waiter.resolve(outcome)
     }
   }
 
   socket.on('data', (chunk) => {
-    state.buf = Buffer.concat([state.buf.subarray(state.pos), chunk])
-    state.pos = 0
+    // Append only. Truncating here would invalidate the absolute offsets held
+    // in `state.pending` while a literal spans several TCP chunks.
+    state.buf = Buffer.concat([state.buf, chunk])
     advance()
   })
   socket.once('error', (err) => {
@@ -73,82 +82,67 @@ function createReader(socket) {
   })
 
   /**
-   * One assembly step: returns {lines, consumed} when a stop-tagged line
-   * completed, or null when more bytes are needed. `state.pending` carries
-   * the partially assembled logical line (text so far + collected literals).
+   * One assembly step: returns {lines, consumed} once a stop-tagged line
+   * completed, or null when more bytes are needed.
+   *
+   * The state machine is deliberately small and index-based:
+   *   - `pending.text` is the logical line assembled so far;
+   *   - `pending.literals` are its literal byte blocks, in wire order;
+   *   - `pending.end` is the absolute index in `buf` just past the last byte
+   *     consumed for that line (the CRLF that ended the current segment);
+   *   - `pos` is where the *next* segment starts.
+   *
+   * A segment ends at CRLF. If the segment ends with `{n}`, the next `n` bytes
+   * are a literal (taken from `end + 2`, skipping that CRLF) and the segment
+   * after it continues the same logical line. Nothing here ever re-bases `buf`,
+   * so an absolute index stays valid across any number of TCP chunks.
    */
   function step(st, stop) {
     const lines = st.emitted ?? []
     st.emitted = lines
     while (true) {
-      let pending = st.pending
-      if (pending === null) {
-        const idx = st.buf.indexOf('\r\n', st.pos)
-        if (idx < 0) return null
-        pending = { text: st.buf.subarray(st.pos, idx).toString('utf8'), literals: [], end: idx }
-        st.pos = idx + 2
-      }
+      const pending = st.pending ?? { text: '', literals: [], end: st.pos - 2 }
       st.pending = null
-      // If the assembled text so far ends with {n}, pull literal + continuation.
-      let m = /\{(\d+)\}$/.exec(pending.text)
-      while (m) {
-        const want = Number(m[1])
+      // Resume: the previous call stopped because a literal was incomplete.
+      if (pending.wantLiteral !== undefined) {
+        const want = pending.wantLiteral
         const litStart = pending.end + 2
         if (litStart + want > st.buf.length) {
-          st.pending = pending // literal bytes incomplete; wait for data
+          st.pending = pending
           return null
         }
         pending.literals.push(st.buf.subarray(litStart, litStart + want))
+        pending.text += `\u0000LIT${pending.literals.length - 1}\u0000`
         let cursor = litStart + want
         if (st.buf.subarray(cursor, cursor + 2).toString('latin1') === '\r\n') cursor += 2
-        const contEnd = st.buf.indexOf('\r\n', cursor)
-        if (contEnd < 0) {
-          // Continuation text incomplete: keep what we have, drop the consumed
-          // prefix by advancing pos, and wait for more data with pending set
-          // to a "resume from pos" marker (text rebuilt on next round).
-          st.pending = { resumeAfterLiteral: true, literals: pending.literals, prefix: pending.text.slice(0, m.index) + `\u0000LIT${pending.literals.length - 1}\u0000`, end: cursor - 2 }
-          st.pos = cursor
-          return null
-        }
-        const contText = st.buf.subarray(cursor, contEnd).toString('utf8')
-        pending.text = pending.text.slice(0, m.index) + `\u0000LIT${pending.literals.length - 1}\u0000` + contText
-        pending.end = contEnd
-        st.pos = contEnd + 2
-        m = /\{(\d+)\}$/.exec(pending.text)
+        pending.end = cursor - 2
+        st.pos = cursor
+        delete pending.wantLiteral
+        // Fall through to read the continuation segment.
       }
-      if (pending.resumeAfterLiteral) {
-        // Rebuild from the marker: text tail starts at st.pos.
-        const contEnd = st.buf.indexOf('\r\n', st.pos)
-        if (contEnd < 0) return null
-        pending.text = pending.prefix + st.buf.subarray(st.pos, contEnd).toString('utf8')
-        pending.end = contEnd
-        st.pos = contEnd + 2
-        delete pending.resumeAfterLiteral
-        const m2 = /\{(\d+)\}$/.exec(pending.text)
-        if (m2) {
-          st.pending = pending
-          // Loop: literal assembly applies to this pending line now.
-          let mm = /\{(\d+)\}$/.exec(pending.text)
-          while (mm) {
-            const want = Number(mm[1])
-            const litStart = pending.end + 2
-            if (litStart + want > st.buf.length) { st.pending = pending; return null }
-            pending.literals.push(st.buf.subarray(litStart, litStart + want))
-            let cursor = litStart + want
-            if (st.buf.subarray(cursor, cursor + 2).toString('latin1') === '\r\n') cursor += 2
-            const contEnd2 = st.buf.indexOf('\r\n', cursor)
-            if (contEnd2 < 0) {
-              st.pending = { resumeAfterLiteral: true, literals: pending.literals, prefix: pending.text.slice(0, mm.index) + `\u0000LIT${pending.literals.length - 1}\u0000`, end: cursor - 2 }
-              st.pos = cursor
-              return null
-            }
-            pending.text = pending.text.slice(0, mm.index) + `\u0000LIT${pending.literals.length - 1}\u0000` + st.buf.subarray(cursor, contEnd2).toString('utf8')
-            pending.end = contEnd2
-            st.pos = contEnd2 + 2
-            mm = /\{(\d+)\}$/.exec(pending.text)
-          }
-        }
+
+      // Read one segment (up to CRLF).
+      const idx = st.buf.indexOf('\r\n', st.pos)
+      if (idx < 0) {
+        // Segment incomplete: remember what we have so the next chunk appends.
+        st.pending = pending
+        return null
       }
+      pending.text += st.buf.subarray(st.pos, idx).toString('utf8')
+      pending.end = idx
+      st.pos = idx + 2
+
+      const marker = /\{(\d+)\}$/.exec(pending.text)
+      if (marker !== null) {
+        // The segment promised a literal: its bytes follow the CRLF.
+        pending.wantLiteral = Number(marker[1])
+        // Drop the `{n}` text itself; the marker position is kept as LITn.
+        pending.text = pending.text.slice(0, marker.index)
+        st.pending = pending
+        // Loop again: the resume branch at the top consumes the literal.
+        continue
+      }
+
       lines.push(new Line(pending.text, pending.literals))
       const last = lines[lines.length - 1]
       if (last.text.startsWith(stop)) {
@@ -157,6 +151,8 @@ function createReader(socket) {
         return out
       }
       if (st.pos >= st.buf.length) return null
+      // Next segment belongs to the next logical line.
+      st.pending = { text: '', literals: [], end: st.pos - 2 }
     }
   }
 
