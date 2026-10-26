@@ -2,10 +2,12 @@
  * dsh-smart-mail — minimal IMAP4rev1 client over node:tls.
  *
  * Implements exactly what the poller and read_emails need: LOGIN, SELECT
- * INBOX, UID SEARCH SINCE, UID FETCH (ENVELOPE + BODY.PEEK preview),
- * LOGOUT. IMAP literals ({n} byte blocks — how servers transmit UTF-8
- * subjects) are assembled at the byte level before line parsing.
+ * INBOX, UID SEARCH SINCE, UID FETCH (headers + BODY.PEEK preview), LOGOUT.
+ * IMAP literals ({n} byte blocks — how servers transmit UTF-8 subjects and
+ * bodies) are assembled at the byte level before line parsing.
  */
+
+import { extractBodyPreview } from './mime.mjs'
 
 /** UTF-8 literal argument for command writing. */
 function lit(value) {
@@ -20,8 +22,7 @@ function quoted(value) {
 }
 
 /** One logical response line: header text with \u0000LITn\u0000 markers + literal buffers. */
-export class Line {
-  constructor(text, literals) {
+export class Line {  constructor(text, literals) {
     this.text = text
     this.literals = literals
   }
@@ -345,21 +346,16 @@ export function parseFetchLine(line) {
   return out
 }
 
-/** Best-effort decode of BODY[TEXT] bytes into a short preview. */
+/**
+ * Best-effort decode of BODY[TEXT] bytes into a short preview.
+ *
+ * Delegates to the MIME walker: a `multipart/alternative` body must be split on
+ * its boundary and each part decoded by its own transfer encoding. The previous
+ * version base64-decoded the whole body whenever that header appeared anywhere,
+ * which turned every multipart mail (QQ, most clients) into an empty preview.
+ */
 function decodeBodyPreview(bytes) {
-  let text = null
-  const head = bytes.toString('latin1', 0, Math.min(bytes.length, 800))
-  if (/Content-Transfer-Encoding:\s*base64/i.test(head)) {
-    try {
-      const b64 = bytes.toString('utf8').replace(/^[\s\S]*?\r?\n\r?\n/, '')
-      text = Buffer.from(b64.replace(/[^A-Za-z0-9+/=]/g, ''), 'base64').toString('utf8')
-    } catch {}
-  }
-  if (text == null) {
-    text = bytes.toString('utf8').replace(/^[\s\S]*?\r?\n\r?\n/, '')
-  }
-  text = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-  return text.slice(0, 300)
+  return extractBodyPreview(bytes, 300)
 }
 
 /** Open a session and LOGIN. */

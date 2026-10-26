@@ -53,9 +53,56 @@ DSH 本地插件：**一站式邮件收发 + 白名单智能唤醒 + 同一邮�
    把 id 从 `archivedSessionIds` 里摘掉。实际走哪条路记在日志的 `unarchivePath` 里。
    拉回失败才降级（并明确记 `error`），不会假装成功。
 
-### 5. 模型
-续接会话沿用**该会话自己**的模型；新建会话不写死模型（不记录 `model/selection`），
-请求装配回落到 `agentDefaultModel`（DSH 当前默认模型）。
+### 5. 邮件会话模型（与会话页面的模型选择一致）
+
+邮件唤起的会话可以指定模型，选项来自 Host 的 `sessionController.modelCatalog()`——
+和会话页面上的选择器是**同一份目录**（provider / model / 推理档位）。
+
+**默认行为不变**：不选任何模型时，会话跟随 DSH 当前默认模型。
+
+**模型不可用 → 本次调用回落默认**：选择会先对照目录校验（provider 是否可路由、
+模型是否还在、推理档位是否还支持）。任一项不满足就用部署默认模型跑这一封，
+并在日志的 `modelFallback` 里写明原因，**不会因此漏回邮件**。
+
+**优先级**：线程自己的模型 → 面板/配置的模型 → 部署默认。
+
+**不污染全局默认**：实现上只用会话级的 `model/selection` 事件
+（`resolveCallConfig` 校验后 `session.append('model/selection', …)`），
+**不调用** `selectModel()`——后者会把选择一并写进部署默认，那会让邮件唤醒
+悄悄改掉你其他对话用的模型。
+
+配置（`cordis.patch.yml` 或面板）：
+
+```yaml
+modelSelection:
+  provider: deepseek-official
+  model: deepseek-flash
+  reasoningEffort: high   # 可省略，省略则用该模型的默认档位
+```
+
+单个线程可以覆盖：面板「邮件线程 → 会话映射」里每行有模型下拉，
+或 `POST /smart-mail/thread-model {tag, selection|null}`。
+
+日志里每次唤醒都会记 `model`（实际使用的）、`modelSource`
+（`thread` / `config` / `default`）和 `modelFallback`（降级原因，如有）。
+
+### 6. 新建会话未指定模型时
+不写死模型（不记录 `model/selection`），请求装配回落到
+`agentDefaultModel`（DSH 当前默认模型）。续接会话沿用该会话自己的模型。
+
+### 7. 正文识别（MIME）
+
+`BODY[TEXT]` 由 `mime.mjs` 解析，而不是"猜一次 base64"：
+
+- **multipart 拆包**：按 boundary 切开，每个部件用它自己的
+  `Content-Transfer-Encoding`（base64 / quoted-printable / 7bit）解码；
+- **优先 text/plain**，没有才用 text/html（并剥掉 `<style>`/`<script>`/标签）；
+- **boundary 推断**：QQ 返回的正文**没有顶层 `Content-Type`**，只给部件列表，
+  所以会从 `----=_NextPart_…` 这样的分隔行推断 boundary；
+- 开头泄漏的裸 CSS 规则块会被跳过，让预览从正文开始。
+
+> 此前版本在 multipart 邮件上把整段正文当成 base64 解码，结果**正文为空**，
+> 面板显示"无正文"、模型也拿不到内容。`test/mime.test.mjs` 钉住了这些形状。
 
 ## 活动日志
 

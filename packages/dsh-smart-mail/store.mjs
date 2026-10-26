@@ -250,6 +250,40 @@ export function bumpThreadRound(tag) {
   return record.round
 }
 
+/**
+ * Pin (or clear) the model one thread's session should use.
+ *
+ * Stored on the thread rather than in config so a single conversation can be
+ * moved to another model without changing every future mail session.
+ *
+ * @param {string} tag
+ * @param {object|null} selection `{provider, model, reasoningEffort?}` or null to clear
+ * @returns {{ok: boolean, tag: string, modelSelection: object|null, error?: string}}
+ */
+export function setThreadModel(tag, selection) {
+  const threads = loadThreads()
+  const record = threads.byTag[tag]
+  if (record === undefined) return { ok: false, tag, modelSelection: null, error: 'unknown thread tag' }
+  if (selection === null || selection === undefined) {
+    delete record.modelSelection
+  } else {
+    record.modelSelection = {
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+    }
+  }
+  record.updatedAt = Date.now()
+  saveThreads(threads)
+  return { ok: true, tag, modelSelection: record.modelSelection ?? null }
+}
+
+/** Read one thread's pinned model, or `undefined`. */
+export function threadModel(tag) {
+  if (!tag) return undefined
+  return loadThreads().byTag[tag]?.modelSelection
+}
+
 /** Record one of our own outgoing Message-IDs so replies to it resolve to the thread. */
 export function recordOutgoing(messageId, tag) {
   if (!messageId || !tag) return

@@ -76,6 +76,11 @@ window.__ModuleLoader__.load({
       },
       help: { color: COLOR.muted, fontSize: 11, lineHeight: 1.7, marginTop: 4 },
       switchWrap: { display: 'inline-flex', alignItems: 'center', gap: 8 },
+      stepButton: {
+        cursor: 'pointer', width: 28, height: 28, flex: '0 0 auto', padding: 0, borderRadius: 8,
+        border: `1px solid ${COLOR.border}`, background: COLOR.nested, color: 'inherit',
+        font: '14px/1 inherit', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      },
     }
 
     async function api(path, init) {
@@ -90,6 +95,114 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.row },
         h('div', { style: styles.label }, label),
         children)
+    }
+
+    /**
+     * A number field that can actually be typed into.
+     *
+     * A plain controlled `<input type="number">` bound to a number cannot be
+     * retyped: clearing it yields `''`, `Number('') || fallback` immediately
+     * rewrites the fallback, and the periodic status refresh overwrites whatever
+     * is in flight. The result is that the only usable gesture is the spinner
+     * arrow, one step at a time.
+     *
+     * So the draft is kept as *text* while the user types, and only parsed and
+     * clamped on commit (blur or Enter). While the field is focused the parent's
+     * refresh value is ignored, so a poll landing mid-edit cannot clobber it.
+     *
+     * The pure rules live in ./number-field.mjs (and are unit-tested there); this
+     * component is the DOM binding for them. The client bundle cannot import a
+     * sibling .mjs, so the same few lines are repeated here — keep them in step.
+     *
+     * @param {object} props
+     * @param {string} props.label field label
+     * @param {number} props.value committed value
+     * @param {(next: number) => void} props.onCommit called with the clamped value
+     * @param {number} props.min minimum accepted value
+     * @param {number} [props.max] maximum accepted value
+     * @param {number} [props.step] step-button size
+     * @param {string} [props.unit] suffix shown after the field
+     * @param {string} [props.width] flex basis for the input
+     */
+    function NumberField({ label, value, onCommit, min, max, step = 1, unit, width = '0 0 100px' }) {
+      const [draft, setDraft] = useState(String(value))
+      const [editing, setEditing] = useState(false)
+
+      // Follow the committed value only while the field is not being edited.
+      useEffect(() => {
+        if (!editing) setDraft(String(value))
+      }, [value, editing])
+
+      const parseDraft = (raw) => {
+        const text = String(raw ?? '').trim()
+        if (text === '') return null
+        const parsed = Number(text)
+        if (!Number.isFinite(parsed)) return null
+        let next = Math.trunc(parsed)
+        if (next < min) next = min
+        if (max !== undefined && next > max) next = max
+        return next
+      }
+
+      // Commit a resolved value: show it, and persist only when it changed.
+      const apply = (next) => {
+        setDraft(String(next))
+        if (next !== value) onCommit(next)
+      }
+
+      const commit = () => {
+        setEditing(false)
+        const next = parseDraft(draft)
+        if (next === null) {
+          // Blank or not a number: restore the committed value, never guess.
+          setDraft(String(value))
+          return
+        }
+        apply(next)
+      }
+
+      const nudge = (direction) => {
+        // Step from whatever is typed, and clamp *after* stepping: clamping the
+        // partial draft first would turn "1" into min and then add the step.
+        const text = String(draft ?? '').trim()
+        const typed = text !== '' && Number.isFinite(Number(text)) ? Math.trunc(Number(text)) : null
+        const base = typed ?? value
+        let next = base + direction * step
+        if (next < min) next = min
+        if (max !== undefined && next > max) next = max
+        apply(next)
+      }
+
+      return h(Field, { label },
+        h('div', { style: styles.switchWrap },
+          h('input', {
+            style: { ...styles.input, flex: width, boxSizing: 'border-box' },
+            // `text` + inputMode keeps mobile keyboards numeric while letting the
+            // field hold a partial value like '' or '3' on the way to '300'.
+            type: 'text',
+            inputMode: 'numeric',
+            value: draft,
+            onFocus: () => setEditing(true),
+            onChange: (e) => setDraft(e.target.value.replace(/[^\d]/g, '')),
+            onBlur: commit,
+            onKeyDown: (e) => {
+              if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() }
+              if (e.key === 'Escape') { setDraft(String(value)); e.currentTarget.blur() }
+            },
+          }),
+          h('button', {
+            type: 'button',
+            style: styles.stepButton,
+            'aria-label': `${label} 减少`,
+            onClick: () => nudge(-1),
+          }, '−'),
+          h('button', {
+            type: 'button',
+            style: styles.stepButton,
+            'aria-label': `${label} 增加`,
+            onClick: () => nudge(1),
+          }, '+'),
+          unit === undefined ? null : h('span', { style: styles.help }, unit)))
     }
 
     // One log line per record. The record shape is unchanged (`at` first, then
@@ -118,6 +231,91 @@ window.__ModuleLoader__.load({
       return `${time} [${kind}] ${detail}`
     }
 
+    /**
+     * Model picker, mirroring the session page's selector.
+     *
+     * The catalog comes from the Host (`/models` → `sessionController.modelCatalog()`),
+     * so the options are exactly the routes a conversation could actually run:
+     * provider groups, their models, and each model's reasoning efforts. An empty
+     * value means "follow the deployment default", which is the previous behaviour.
+     *
+     * @param {object} props
+     * @param {object|null} props.catalog `{ok, groups, failures, default}` or null while loading
+     * @param {object|null} props.value current `{provider, model, reasoningEffort?}` or null
+     * @param {(next: object|null) => void} props.onChange
+     */
+    function ModelPicker({ catalog, value, onChange }) {
+      const groups = catalog?.groups ?? []
+      // Flatten to `provider\u0000model` keys so a plain <select> can express both.
+      const options = []
+      for (const group of groups) {
+        for (const model of group.models ?? []) {
+          options.push({
+            key: `${group.id}\u0000${model.id}`,
+            provider: group.id,
+            model: model.id,
+            providerName: group.name ?? group.id,
+            modelName: model.name ?? model.id,
+            efforts: model.reasoning?.efforts ?? [],
+            defaultEffort: model.reasoning?.defaultEffort,
+          })
+        }
+      }
+      const currentKey = value === null || value === undefined ? '' : `${value.provider}\u0000${value.model}`
+      const current = options.find((option) => option.key === currentKey)
+      const effortChoices = current?.efforts ?? []
+
+      const pickModel = (key) => {
+        if (key === '') { onChange(null); return }
+        const option = options.find((candidate) => candidate.key === key)
+        if (option === undefined) return
+        onChange({
+          provider: option.provider,
+          model: option.model,
+          // Carry the model's own default effort, exactly as the session page does.
+          ...(option.defaultEffort === undefined ? {} : { reasoningEffort: option.defaultEffort }),
+        })
+      }
+
+      const pickEffort = (effort) => {
+        if (value === null || value === undefined) return
+        const next = { provider: value.provider, model: value.model }
+        if (effort !== '') next.reasoningEffort = effort
+        onChange(next)
+      }
+
+      return h('div', { style: styles.row },
+        h('div', { style: styles.label }, '邮件会话模型'),
+        h('select', {
+          style: { ...styles.input, flex: '1 1 260px' },
+          value: currentKey,
+          disabled: catalog === null,
+          onChange: (e) => pickModel(e.target.value),
+        },
+          h('option', { value: '' },
+            catalog?.default === undefined || catalog?.default === null
+              ? '跟随默认（不指定模型）'
+              : `跟随默认（${catalog.default.provider}/${catalog.default.model}）`),
+          groups.length === 0
+            ? h('option', { value: '', disabled: true }, catalog === null ? '正在读取模型目录…' : '（没有可用模型）')
+            : groups.map((group) => h('optgroup', { key: group.id, label: group.name ?? group.id },
+              (group.models ?? []).map((model) => h('option', {
+                key: `${group.id}\u0000${model.id}`,
+                value: `${group.id}\u0000${model.id}`,
+              }, model.name ?? model.id))))),
+        effortChoices.length === 0 ? null : h('select', {
+          style: { ...styles.input, flex: '0 0 110px' },
+          value: value?.reasoningEffort ?? '',
+          onChange: (e) => pickEffort(e.target.value),
+        },
+          h('option', { value: '' }, '默认档位'),
+          effortChoices.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name ?? effort.id))),
+        h('span', { style: styles.help },
+          catalog?.ok === false
+            ? `模型目录不可用：${catalog.error}`
+            : '选中的模型不可用时，本次唤醒自动改用默认模型。'))
+    }
+
     function SmartMailPage() {
       const [status, setStatus] = useState(null)
       const [notice, setNotice] = useState(null)
@@ -126,9 +324,11 @@ window.__ModuleLoader__.load({
       const [cfg, setCfg] = useState({
         pollIntervalSec: 120, wakePrompt: '', wakeCwd: '', enabled: true,
         continueThreads: true, interruptSameThread: true, autoUnarchive: true,
+        modelSelection: null,
         logMaxBytes: 2097152, logKeepDays: 7, logKeepFiles: 20,
       })
       const [threads, setThreads] = useState(null)
+      const [catalog, setCatalog] = useState(null)
 
       const refresh = useCallback(async () => {
         try {
@@ -144,6 +344,7 @@ window.__ModuleLoader__.load({
               continueThreads: data.config.continueThreads !== false,
               interruptSameThread: data.config.interruptSameThread !== false,
               autoUnarchive: data.config.autoUnarchive !== false,
+              modelSelection: data.config.modelSelection ?? null,
               logMaxBytes: data.config.logMaxBytes ?? 2097152,
               logKeepDays: data.config.logKeepDays ?? 7,
               logKeepFiles: data.config.logKeepFiles ?? 20,
@@ -157,6 +358,13 @@ window.__ModuleLoader__.load({
           if (data.ok) setThreads(data)
         } catch {
           setThreads(null)
+        }
+        try {
+          // The same catalog the session page renders.
+          const data = await api('/models')
+          setCatalog(data.ok ? data : { ok: false, error: data.error ?? 'unavailable' })
+        } catch (cause) {
+          setCatalog({ ok: false, error: cause instanceof Error ? cause.message : String(cause) })
         }
       }, [])
 
@@ -213,7 +421,35 @@ window.__ModuleLoader__.load({
         const next = { ...cfg, ...patch }
         setCfg(next)
         const result = await api('/config', { method: 'POST', body: JSON.stringify(patch) })
-        if (!result.ok) setNotice({ ok: false, text: `配置保存失败：${result.error}` })
+        if (!result.ok) {
+          setNotice({ ok: false, text: `配置保存失败：${result.error}` })
+        } else if (result.persisted === false) {
+          // The change is live for this run but could not be written to the
+          // profile, so it would be lost on restart — say so instead of hiding it.
+          setNotice({
+            ok: false,
+            text: `已生效，但没能写回 profile 配置（重启会丢失）：${result.persistError ?? '未知原因'}`,
+          })
+        } else if (result.changedFields !== undefined && result.changedFields.length > 0) {
+          setNotice({ ok: true, text: '配置已保存（重启后仍生效）' })
+        }
+        await refresh()
+      }
+
+      /** Pin (or clear) the model one thread's session should use. */
+      const saveThreadModel = async (tag, selection) => {
+        const result = await api('/thread-model', {
+          method: 'POST',
+          body: JSON.stringify({ tag, selection }),
+        })
+        setNotice(result.ok
+          ? {
+            ok: true,
+            text: selection === null
+              ? `线程 ${tag} 已改回跟随默认模型`
+              : `线程 ${tag} 模型已设为 ${selection.provider}/${selection.model}`,
+          }
+          : { ok: false, text: `线程模型保存失败：${result.error}` })
         await refresh()
       }
 
@@ -279,12 +515,14 @@ window.__ModuleLoader__.load({
                 role: 'switch', 'aria-checked': cfg.enabled,
                 onClick: () => saveConfig({ enabled: !cfg.enabled }),
               }, cfg.enabled ? '已启用' : '已停用'))),
-          h(Field, { label: '轮询间隔(秒)' },
-            h('input', {
-              style: { ...styles.input, flex: '0 0 100px' }, type: 'number', min: 30, value: cfg.pollIntervalSec,
-              onChange: (e) => setCfg((c) => ({ ...c, pollIntervalSec: Number(e.target.value) || 120 })),
-              onBlur: () => saveConfig({ pollIntervalSec: cfg.pollIntervalSec }),
-            })),
+          h(NumberField, {
+            label: '轮询间隔(秒)',
+            value: cfg.pollIntervalSec,
+            min: 30,
+            step: 30,
+            unit: '秒，最小 30',
+            onCommit: (next) => saveConfig({ pollIntervalSec: next }),
+          }),
           h(Field, { label: 'allowFrom' },
             h('textarea', {
               style: { ...styles.input, minHeight: 72, fontFamily: 'ui-monospace, Consolas, monospace' },
@@ -313,7 +551,17 @@ window.__ModuleLoader__.load({
           h('div', { style: styles.row },
             h('div', { style: styles.label }),
             h('button', { style: styles.button, onClick: pollNow }, '立即轮询一次'),
-            h('span', { style: styles.help }, '唤醒模型跟随 DSH 当前默认模型（会话不写死 model/selection），无需在此选择。'))),
+            h('span', { style: styles.help }, '唤醒模型默认跟随 DSH 当前默认模型；可在下面「邮件会话模型」里指定。')),
+
+          h(ModelPicker, {
+            catalog,
+            value: cfg.modelSelection,
+            onChange: (next) => saveConfig({ modelSelection: next }),
+          }),
+          h('div', { style: { ...styles.row, marginTop: -2 } },
+            h('div', { style: styles.label }),
+            h('span', { style: styles.help },
+              '与会话页面的模型选择一致（provider / model / 推理档位）。不选 = 跟随默认；选中的模型不可用时，本次唤醒自动回落默认，不会漏回邮件。'))),
 
         // ---- thread continuation --------------------------------------
         h('div', { style: styles.section },
@@ -347,25 +595,31 @@ window.__ModuleLoader__.load({
         // ---- log rotation ---------------------------------------------
         h('div', { style: styles.section },
           h('h2', { style: styles.sectionTitle }, '日志轮转'),
-          h(Field, { label: '单文件上限(KiB)' },
-            h('input', {
-              style: { ...styles.input, flex: '0 0 120px' }, type: 'number', min: 64,
-              value: Math.round(cfg.logMaxBytes / 1024),
-              onChange: (e) => setCfg((c) => ({ ...c, logMaxBytes: Math.max(64, Number(e.target.value) || 2048) * 1024 })),
-              onBlur: () => saveConfig({ logMaxBytes: cfg.logMaxBytes }),
-            })),
-          h(Field, { label: '保留天数' },
-            h('input', {
-              style: { ...styles.input, flex: '0 0 100px' }, type: 'number', min: 1, value: cfg.logKeepDays,
-              onChange: (e) => setCfg((c) => ({ ...c, logKeepDays: Math.max(1, Number(e.target.value) || 7) })),
-              onBlur: () => saveConfig({ logKeepDays: cfg.logKeepDays }),
-            })),
-          h(Field, { label: '最多归档数' },
-            h('input', {
-              style: { ...styles.input, flex: '0 0 100px' }, type: 'number', min: 1, value: cfg.logKeepFiles,
-              onChange: (e) => setCfg((c) => ({ ...c, logKeepFiles: Math.max(1, Number(e.target.value) || 20) })),
-              onBlur: () => saveConfig({ logKeepFiles: cfg.logKeepFiles }),
-            })),
+          h(NumberField, {
+            label: '单文件上限(KiB)',
+            value: Math.round(cfg.logMaxBytes / 1024),
+            min: 64,
+            step: 64,
+            width: '0 0 120px',
+            unit: 'KiB，最小 64',
+            onCommit: (next) => saveConfig({ logMaxBytes: next * 1024 }),
+          }),
+          h(NumberField, {
+            label: '保留天数',
+            value: cfg.logKeepDays,
+            min: 1,
+            step: 1,
+            unit: '天',
+            onCommit: (next) => saveConfig({ logKeepDays: next }),
+          }),
+          h(NumberField, {
+            label: '最多归档数',
+            value: cfg.logKeepFiles,
+            min: 1,
+            step: 1,
+            unit: '个',
+            onCommit: (next) => saveConfig({ logKeepFiles: next }),
+          }),
           h('div', { style: { ...styles.row, marginTop: -2 } },
             h('div', { style: styles.label }),
             h('span', { style: styles.help },
@@ -390,8 +644,43 @@ window.__ModuleLoader__.load({
             `共 ${threads?.count ?? 0} 个线程（显示最近 50 个），已登记我方 Message-ID ${threads?.outgoingCount ?? 0} 条。回复这些线程会续接对应会话。`),
           (threads?.threads ?? []).length === 0
             ? h('div', { style: styles.help }, '（还没有线程）')
-            : h('div', { style: styles.log },
-              threads.threads.map((t) => `${t.tag} · 会话 ${t.sessionId} · 第 ${t.round ?? 0} 轮 · ${t.subject ?? '(无主题)'}`).join('\n'))))
+            : h('div', null, threads.threads.map((t) => renderThreadRow(t, {
+              groups: catalog?.groups ?? [],
+              onSave: (tag, selection) => saveThreadModel(tag, selection),
+            })))))
+    }
+
+    /** One thread row: identity, the session it maps to, and its model pin. */
+    function renderThreadRow(t, { groups, onSave }) {
+      const current = t.modelSelection === undefined || t.modelSelection === null
+        ? ''
+        : `${t.modelSelection.provider}\u0000${t.modelSelection.model}`
+      const label = t.modelSelection === undefined || t.modelSelection === null
+        ? '模型跟随默认'
+        : `模型 ${t.modelSelection.provider}/${t.modelSelection.model}${t.modelSelection.reasoningEffort === undefined ? '' : `@${t.modelSelection.reasoningEffort}`}`
+
+      return h('div', { key: t.tag, style: styles.accountRow },
+        h('div', { style: styles.accountMain },
+          h('div', { style: styles.accountAddress }, `${t.tag} · 第 ${t.round ?? 0} 轮 · ${t.subject ?? '(无主题)'}`),
+          h('div', { style: styles.accountMeta }, `会话 ${t.sessionId} · ${label}`)),
+        h('select', {
+          style: { ...styles.input, flex: '0 0 190px' },
+          value: current,
+          onChange: (e) => {
+            const key = e.target.value
+            const selection = key === '' ? null : (() => {
+              const [provider, model] = key.split('\u0000')
+              return { provider, model }
+            })()
+            void onSave(t.tag, selection)
+          },
+        },
+          h('option', { value: '' }, '跟随默认'),
+          groups.map((group) => h('optgroup', { key: group.id, label: group.name ?? group.id },
+            (group.models ?? []).map((model) => h('option', {
+              key: `${group.id}\u0000${model.id}`,
+              value: `${group.id}\u0000${model.id}`,
+            }, model.name ?? model.id))))))
     }
 
     function apply(ctx) {

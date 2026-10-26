@@ -23,6 +23,8 @@
  * to debug a failure. See store.mjs for the rotation policy.
  */
 
+import { readFileSync } from 'node:fs'
+
 import {
   PRESETS,
   LOG_ROTATION,
@@ -39,6 +41,7 @@ import {
   loadThreads,
   bindThread,
   bumpThreadRound,
+  setThreadModel,
   recordOutgoing,
   tagForOutgoing,
   tagForSession,
@@ -66,9 +69,21 @@ import {
   IgnoreReason,
 } from './threads.mjs'
 import { DeliveryMode, deliverToSession, sessionState, wakeWithMail } from './wake.mjs'
+import { applySessionModel, chooseSelection, describeSelection, isSelection, readCatalog } from './model-choice.mjs'
 
 const ROUTE = '/smart-mail'
-const PLUGIN_VERSION = '0.2.0'
+/**
+ * Reported version. Read from package.json so it can never drift from the
+ * published artifact — it said 0.2.0 while the package was already 0.3.0.
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const here = new URL('./package.json', import.meta.url)
+    return JSON.parse(readFileSync(here, 'utf8')).version ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 
 function json(res, status, value) {
   const body = JSON.stringify(value)
@@ -108,6 +123,18 @@ function normalizeConfig(config) {
     continueThreads: config?.continueThreads !== false,
     // Restore an archived thread session instead of abandoning the thread.
     autoUnarchive: config?.autoUnarchive !== false,
+    /**
+     * Model for mail-triggered sessions, same shape as the session page's
+     * selector: `{provider, model, reasoningEffort?}`. Unset means "follow the
+     * deployment default", which is the behaviour before this option existed.
+     */
+    modelSelection: isSelection(config?.modelSelection)
+      ? {
+        provider: config.modelSelection.provider,
+        model: config.modelSelection.model,
+        ...(config.modelSelection.reasoningEffort === undefined ? {} : { reasoningEffort: String(config.modelSelection.reasoningEffort) }),
+      }
+      : null,
     logMaxBytes: Math.max(64 * 1024, Number(config?.logMaxBytes ?? LOG_ROTATION.maxBytes)),
     logKeepDays: Math.max(1, Number(config?.logKeepDays ?? LOG_ROTATION.keepDays)),
     logKeepFiles: Math.max(1, Number(config?.logKeepFiles ?? LOG_ROTATION.keepFiles)),
@@ -131,6 +158,7 @@ const CONFIG_FIELDS = [
   'interruptSameThread',
   'continueThreads',
   'autoUnarchive',
+  'modelSelection',
   'logMaxBytes',
   'logKeepDays',
   'logKeepFiles',
@@ -201,6 +229,44 @@ function renderPrompt(mail, cfg, extra) {
     '如需回信，直接调用 send_email（带上 inReplyTo 或 threadTag 以保持同一线程）。',
   )
   return lines.join('\n')
+}
+
+/**
+ * Persist the effective config back into the profile patch layer.
+ *
+ * The panel edits `liveConfig` in memory, which survives until the Host restarts
+ * and then reverts to whatever the profile says — so a poll interval or model
+ * chosen in the panel silently reset on every reboot. `configEditor.edit()` is
+ * the same durable write `agentDefaultModel.saveSelection()` uses: it validates
+ * the config, rewrites this entry's row in the profile's `cordis.patch.yml`, and
+ * reconciles the loader.
+ *
+ * The row is written under this plugin's own entry id, so it becomes an ordinary
+ * user override that the bundle layer sits beneath. A failed save is reported to
+ * the caller but never loses the in-memory change for the current run.
+ *
+ * @param {object} ctx Host context
+ * @param {object} nextConfig the config to persist (the whole effective config)
+ * @returns {Promise<{ok: boolean, error?: string}>}
+ */
+async function persistConfig(ctx, nextConfig) {
+  const editor = ctx.get('configEditor')
+  if (editor === undefined) return { ok: false, error: 'configEditor service unavailable (this Host has no profile editor)' }
+  const entry = ctx.fiber?.entry
+  if (entry === undefined) return { ok: false, error: 'this plugin has no loader entry to write' }
+
+  const { modelSelection, ...rest } = nextConfig
+  const payload = {
+    ...rest,
+    ...(modelSelection === null || modelSelection === undefined ? {} : { modelSelection }),
+  }
+
+  try {
+    await editor.edit(entry, () => payload)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 }
 
 /* ------------------------------------------------------------------ polling */
@@ -327,6 +393,62 @@ async function pollAccount(ctx, account, cfg, log) {
  * id and the delivery mode, failure carries the complete error plus the mail
  * headers, which is what makes a failure debuggable after the fact.
  */
+/**
+ * Decide which model this wake should use, and apply it to the session.
+ *
+ * Order: the thread's own pinned model, then the plugin config's model, then the
+ * deployment default. A pinned model that is no longer routable downgrades to the
+ * default *for this wake* — a mail must never go unanswered because a model was
+ * renamed or a provider lost its key.
+ *
+ * @returns {Promise<{model: string, modelSource: string, modelFallback?: string, modelError?: string}>}
+ *   fields ready to merge into a `mail-wake` log record
+ */
+async function applyModelChoice(ctx, sessionId, threadRecord, cfg) {
+  const catalog = await readCatalog(ctx)
+  const configured = cfg.modelSelection ?? undefined
+  const threadSelection = threadRecord?.modelSelection ?? undefined
+
+  // With no catalog the Host cannot tell us what is routable; keep the
+  // deployment default rather than guessing.
+  if (catalog === null) {
+    return { model: 'deployment-default', modelSource: 'default', modelFallback: 'catalog-unavailable' }
+  }
+
+  const choice = chooseSelection({
+    catalog,
+    thread: threadSelection,
+    configured,
+    deployment: catalog.default,
+  })
+
+  if (choice.selection === undefined) {
+    // Nothing to apply: the session keeps whatever the deployment default is,
+    // which is exactly the behaviour before this feature existed.
+    return {
+      model: 'deployment-default',
+      modelSource: choice.source,
+      ...(choice.fallback === undefined ? {} : { modelFallback: choice.fallback }),
+    }
+  }
+
+  const applied = await applySessionModel(ctx, sessionId, choice.selection)
+  if (!applied.ok) {
+    // Applying failed (session vanished, adapter rejected the route). Fall back
+    // to the deployment default and say so; the wake still proceeds.
+    return {
+      model: describeSelection(choice.selection),
+      modelSource: choice.source,
+      modelFallback: `apply-failed: ${applied.error}`,
+    }
+  }
+  return {
+    model: describeSelection(applied.applied),
+    modelSource: choice.source,
+    ...(choice.fallback === undefined ? {} : { modelFallback: choice.fallback }),
+  }
+}
+
 async function handleMail(ctx, account, mail, cfg) {
   const lookupOutgoing = (messageId) => tagForOutgoing(messageId)
   const lookupTag = (tag) => sessionForTag(tag)
@@ -372,6 +494,8 @@ async function handleMail(ctx, account, mail, cfg) {
 
   if (route === 'continue') {
     const round = bumpThreadRound(tag)
+    // Pin the model on the session *before* the prompt, so this turn runs on it.
+    const modelInfo = await applyModelChoice(ctx, sessionId, loadThreads().byTag[tag], cfg)
     const result = await deliverToSession(ctx, {
       sessionId,
       text: renderPrompt(mail, cfg, { isNew: false, round: round || 1, interrupted: false }),
@@ -388,6 +512,7 @@ async function handleMail(ctx, account, mail, cfg) {
         interrupted: result.interrupted === true,
         cancelUsed: result.cancelUsed === true,
         unarchivePath: result.unarchivePath,
+        ...modelInfo,
       })
       appendLog({
         ...base,
@@ -400,10 +525,11 @@ async function handleMail(ctx, account, mail, cfg) {
         wasRunning: result.wasRunning === true,
         unarchivePath: result.unarchivePath ?? null,
         round: round || 1,
+        ...modelInfo,
       }, rotationOf(cfg))
       return { ok: true, sessionId, route }
     }
-    appendLog({ ...base, ok: false, route, sessionId, error: result.error ?? 'unknown delivery failure' }, rotationOf(cfg))
+    appendLog({ ...base, ok: false, route, sessionId, error: result.error ?? 'unknown delivery failure', ...modelInfo }, rotationOf(cfg))
     return { ok: false, sessionId, route }
   }
 
@@ -431,6 +557,10 @@ async function handleMail(ctx, account, mail, cfg) {
     return { ok: false, route }
   }
 
+  // A brand-new session follows the deployment default unless a model is
+  // configured; apply it before the first prompt so the very first turn uses it.
+  const modelInfo = await applyModelChoice(ctx, wake.sessionId, null, cfg)
+
   const bound = bindThread(tag, { sessionId: wake.sessionId, subject: mail.subject })
   if (bound.rebound) {
     // Keep the established binding; the new session is left unreferenced and
@@ -443,6 +573,7 @@ async function handleMail(ctx, account, mail, cfg) {
       sessionId: bound.previousSessionId,
       rebind: { reason: 'tag-already-bound', previousSessionId: bound.previousSessionId, orphanSessionId: wake.sessionId },
       warning: 'thread tag was already bound to another session; kept the original binding',
+      ...modelInfo,
     }, rotationOf(cfg))
     return { ok: true, sessionId: bound.previousSessionId, route: 'continue-fallback' }
   }
@@ -454,6 +585,7 @@ async function handleMail(ctx, account, mail, cfg) {
     stage: 'done',
     route,
     rebind,
+    ...modelInfo,
   })
   appendLog({
     ...base,
@@ -462,6 +594,7 @@ async function handleMail(ctx, account, mail, cfg) {
     sessionId: wake.sessionId,
     tag,
     rebind,
+    ...modelInfo,
   }, rotationOf(cfg))
   return { ok: true, sessionId: wake.sessionId, route }
 }
@@ -478,7 +611,11 @@ function jsonOut() {
 
 const plugin = {
   name: 'smart-mail',
-  inject: ['tools', 'webServer', 'sessionController'],
+  // `llm` is required for the model picker: it resolves and validates a
+  // selection exactly as the session page does. `configEditor` is required so
+  // panel changes can be written back to the profile instead of resetting on
+  // restart.
+  inject: ['tools', 'webServer', 'sessionController', 'llm', 'configEditor'],
 
   Config: undefined,
 
@@ -663,33 +800,77 @@ const plugin = {
       }), 'smart-mail: read_emails tool')
     }
 
-    const applyPoller = () => {
-      if (!liveConfig.enabled) return () => {}
+    /**
+     * Background poller.
+     *
+     * `ctx.effect(execute)` calls `execute()` and keeps *its return value* as the
+     * cleanup. Passing `applyPoller()` — which already returns a cleanup — made
+     * cordis invoke that cleanup immediately: it set `disposed = true` and
+     * cleared the timer it had just created, so the poller never ran and only
+     * the manual `/poll-now` route worked. The factory is therefore passed as the
+     * execute function, not its result.
+     */
+    const startPoller = () => {
       let disposed = false
       let busy = false
+      let timer = null
+      let firstCheck = null
+      let periodSec = 0
+
       const tick = async () => {
         if (disposed || busy) return
+        // A disabled poller keeps its timer but does no work, so re-enabling it
+        // from the panel takes effect on the next beat without a restart.
+        if (!liveConfig.enabled) return
         busy = true
-        for (const account of listAccounts()) {
-          try {
-            await pollAccount(ctx, account, liveConfig, log)
-          } catch (error) {
-            log({
-              kind: 'poll-error',
-              account: account.id,
-              error: error instanceof Error ? error.message : String(error),
-            })
+        try {
+          for (const account of listAccounts()) {
+            try {
+              await pollAccount(ctx, account, liveConfig, log)
+            } catch (error) {
+              log({
+                kind: 'poll-error',
+                account: account.id,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
           }
+        } finally {
+          // Always release the guard: a throw above must not wedge the poller.
+          busy = false
         }
-        busy = false
       }
-      const timer = setInterval(() => { void tick() }, liveConfig.pollIntervalSec * 1000)
-      setTimeout(() => { void tick() }, 8000) // first check shortly after boot
-      return () => {
-        disposed = true
-        clearInterval(timer)
+
+      /** (Re)create the interval for the current period. */
+      const schedule = () => {
+        if (timer !== null) clearInterval(timer)
+        periodSec = liveConfig.pollIntervalSec
+        timer = setInterval(() => { void tick() }, periodSec * 1000)
+        timer.unref?.()
+      }
+
+      schedule()
+      firstCheck = setTimeout(() => { void tick() }, 8000) // first check shortly after boot
+      firstCheck.unref?.()
+
+      return {
+        /** Apply a changed interval without waiting for a restart. */
+        rearm() {
+          if (disposed) return
+          if (liveConfig.pollIntervalSec === periodSec) return
+          log({ kind: 'poller-rearm', fromSec: periodSec, toSec: liveConfig.pollIntervalSec })
+          schedule()
+        },
+        dispose() {
+          disposed = true
+          if (timer !== null) clearInterval(timer)
+          if (firstCheck !== null) clearTimeout(firstCheck)
+        },
       }
     }
+
+    /** Handle to the running poller, so the panel can re-arm it. */
+    let poller = null
 
     const applyRoutes = () => {
       ctx.effect(() => ctx.webServer.register({
@@ -726,6 +907,42 @@ const plugin = {
                   .slice(0, 50)
                   .map(([tag, record]) => ({ tag, ...record })),
               })
+              return
+            }
+            if (route === '/models' && req.method === 'GET') {
+              // The same catalog the session page renders, so the panel offers
+              // exactly the models a conversation could actually run.
+              const catalog = await readCatalog(ctx)
+              json(res, 200, {
+                ok: catalog !== null,
+                ...(catalog === null ? { error: 'model catalog unavailable on this Host' } : {
+                  default: catalog.default ?? null,
+                  groups: catalog.groups ?? [],
+                  failures: catalog.failures ?? [],
+                  configured: liveConfig.modelSelection,
+                }),
+              })
+              return
+            }
+            if (route === '/thread-model' && req.method === 'POST') {
+              const body = await readBody(req)
+              const tag = String(body.tag ?? '').trim().toLowerCase()
+              if (tag === '') { json(res, 400, { ok: false, error: 'missing tag' }); return }
+              const selection = body.selection === null || body.selection === undefined
+                ? null
+                : {
+                  provider: String(body.selection.provider ?? ''),
+                  model: String(body.selection.model ?? ''),
+                  ...(body.selection.reasoningEffort === undefined ? {} : { reasoningEffort: String(body.selection.reasoningEffort) }),
+                }
+              if (selection !== null && (!selection.provider || !selection.model)) {
+                json(res, 400, { ok: false, error: 'selection needs provider and model' })
+                return
+              }
+              const result = setThreadModel(tag, selection)
+              if (!result.ok) { json(res, 404, result); return }
+              log({ kind: 'thread-model', tag, modelSelection: result.modelSelection })
+              json(res, 200, result)
               return
             }
             if (route === '/account' && req.method === 'POST') {
@@ -770,6 +987,7 @@ const plugin = {
                 ...(body.interruptSameThread !== undefined ? { interruptSameThread: Boolean(body.interruptSameThread) } : {}),
                 ...(body.continueThreads !== undefined ? { continueThreads: Boolean(body.continueThreads) } : {}),
                 ...(body.autoUnarchive !== undefined ? { autoUnarchive: Boolean(body.autoUnarchive) } : {}),
+                ...(body.modelSelection !== undefined ? { modelSelection: body.modelSelection } : {}),
                 ...(body.logMaxBytes !== undefined ? { logMaxBytes: body.logMaxBytes } : {}),
                 ...(body.logKeepDays !== undefined ? { logKeepDays: body.logKeepDays } : {}),
                 ...(body.logKeepFiles !== undefined ? { logKeepFiles: body.logKeepFiles } : {}),
@@ -779,6 +997,8 @@ const plugin = {
               // before this call's own record is written under the new limit.
               const rotationChanged = changedNow.some((field) => field.startsWith('log'))
               if (rotationChanged) applyRotationNow('config-panel')
+              // A new interval must take effect now, not at the next restart.
+              if (changedNow.includes('pollIntervalSec')) poller?.rearm()
               if (changedNow.length > 0) {
                 log({
                   kind: 'config-change',
@@ -789,7 +1009,24 @@ const plugin = {
                 })
                 saveLastConfig(liveConfig)
               }
-              json(res, 200, { ok: true, config: liveConfig, changedFields: changedNow })
+              // Write it back to the profile, or the change dies with this process.
+              let persisted = { ok: true }
+              if (changedNow.length > 0) {
+                persisted = await persistConfig(ctx, liveConfig)
+                log({
+                  kind: 'config-persist',
+                  ok: persisted.ok,
+                  ...(persisted.ok ? {} : { error: persisted.error }),
+                  fields: changedNow,
+                })
+              }
+              json(res, 200, {
+                ok: true,
+                config: liveConfig,
+                changedFields: changedNow,
+                persisted: persisted.ok,
+                ...(persisted.ok ? {} : { persistError: persisted.error }),
+              })
               return
             }
             if (route === '/poll-now' && req.method === 'POST') {
@@ -813,7 +1050,12 @@ const plugin = {
     }
 
     applyTools()
-    ctx.effect(applyPoller(), 'smart-mail: poller')
+    // Pass the factory, not its result: ctx.effect calls `execute()` and keeps
+    // the return value as the cleanup.
+    ctx.effect(() => {
+      poller = startPoller()
+      return () => poller?.dispose()
+    }, 'smart-mail: poller')
     applyRoutes()
   },
 }
