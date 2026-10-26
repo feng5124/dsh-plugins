@@ -20,7 +20,7 @@ function quoted(value) {
 }
 
 /** One logical response line: header text with \u0000LITn\u0000 markers + literal buffers. */
-class Line {
+export class Line {
   constructor(text, literals) {
     this.text = text
     this.literals = literals
@@ -257,7 +257,26 @@ export class ImapSession {
   }
 }
 
-export async function connect({ host, port }) {
+/**
+ * Open a socket to the IMAP server.
+ *
+ * `tls: false` connects in the clear, which is only meaningful for a local
+ * test server; every shipped preset sets `tls: true`. The default stays
+ * `true` so an account written before the flag existed keeps its old,
+ * encrypted behaviour.
+ */
+export async function connect({ host, port, tls: secure = true }) {
+  if (secure === false) {
+    const net = await import('node:net')
+    return await new Promise((resolve, reject) => {
+      const socket = net.connect({ host, port }, () => resolve(socket))
+      socket.setTimeout(30_000, () => {
+        socket.destroy()
+        reject(new Error(`IMAP connect timeout: ${host}:${port}`))
+      })
+      socket.once('error', reject)
+    })
+  }
   const tls = await import('node:tls')
   return await new Promise((resolve, reject) => {
     const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: true }, () => resolve(socket))
@@ -403,6 +422,111 @@ export async function fetchSummaries(session, uids) {
   for (const line of lines) {
     const parsed = parseFetchLine(line)
     if (parsed && parsed.uid != null) out.push(parsed)
+  }
+  return out
+}
+
+/**
+ * Decode every RFC 2047 encoded-word in a parsed header map.
+ * @param {Map<string,string>} headers
+ * @returns {Map<string,string>}
+ */
+export function decodeHeaderMap(headers) {
+  const out = new Map()
+  for (const [name, value] of headers) out.set(name, decodeMimeWord(value) ?? value)
+  return out
+}
+
+/**
+ * Parse one `UID FETCH (... BODY[HEADER.FIELDS (...)] ... BODY[TEXT]<0.n>)` line
+ * into the header map plus a body preview.
+ *
+ * The reader keeps literals out of band and leaves `\0LIT<n>\0` markers in the
+ * text, so the section a literal belongs to is decided by the text before it.
+ *
+ * @param {Line} line
+ * @returns {{uid: number, headers: Map<string,string>, headerText: string, preview: string}|null}
+ */
+export function parseThreadedFetchLine(line) {
+  if (!(line instanceof Line) || !/^\*\s+\d+\s+FETCH/i.test(line.text)) return null
+  const text = line.text
+  const uidMatch = /UID\s+(\d+)/i.exec(text)
+  if (uidMatch === null) return null
+  let headerText = ''
+  let preview = ''
+  const marker = /\u0000LIT(\d+)\u0000/g
+  let match
+  while ((match = marker.exec(text)) !== null) {
+    const before = text.slice(0, match.index)
+    const bytes = line.literals[Number(match[1])]
+    if (bytes === undefined) continue
+    if (/BODY\[HEADER\.FIELDS[^\]]*\]\s*$/i.test(before)) headerText = bytes.toString('utf8')
+    else if (/BODY\[TEXT\][^ ]*\s*$/i.test(before)) preview = decodeBodyPreview(bytes)
+  }
+  return { uid: Number(uidMatch[1]), headers: parseHeaderText(headerText), headerText, preview }
+}
+
+/**
+ * Parse a raw header block into a lower-cased map, joining folded lines.
+ * @param {string} headerText
+ * @returns {Map<string,string>}
+ */
+export function parseHeaderText(headerText) {
+  const headers = new Map()
+  let name = null
+  let value = ''
+  const commit = () => {
+    if (name === null) return
+    const trimmed = value.trim()
+    if (headers.has(name)) headers.set(name, `${headers.get(name)} ${trimmed}`.trim())
+    else headers.set(name, trimmed)
+    name = null
+    value = ''
+  }
+  for (const raw of String(headerText ?? '').split(/\r?\n/)) {
+    if (/^[ \t]/.test(raw) && name !== null) {
+      value += ` ${raw.trim()}`
+      continue
+    }
+    const m = /^([!-9;-~]+):\s*(.*)$/.exec(raw)
+    if (m === null) {
+      commit()
+      continue
+    }
+    commit()
+    name = m[1].toLowerCase()
+    value = m[2]
+  }
+  commit()
+  return headers
+}
+
+/**
+ * Fetch the threading headers and a body preview for the given UIDs.
+ *
+ * Headers are fetched with BODY.PEEK so polling never marks mail as read, and
+ * the field list is explicit because ENVELOPE alone does not carry
+ * `References` / `In-Reply-To` / `X-DSH-Session` — exactly what thread
+ * resolution needs.
+ *
+ * @param {ImapSession} session
+ * @param {number[]} uids
+ * @param {string[]} fields header names to request
+ * @returns {Promise<Array<{uid:number, headers:Map<string,string>, preview:string}>>}
+ */
+export async function fetchThreaded(session, uids, fields) {
+  if (uids.length === 0) return []
+  const list = fields.join(' ')
+  const lines = await session.exec([
+    'UID',
+    'FETCH',
+    uids.join(','),
+    `(UID BODY.PEEK[HEADER.FIELDS (${list})] BODY.PEEK[TEXT]<0.4096>)`,
+  ])
+  const out = []
+  for (const line of lines) {
+    const parsed = parseThreadedFetchLine(line)
+    if (parsed !== null) out.push(parsed)
   }
   return out
 }

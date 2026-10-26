@@ -2,25 +2,42 @@
 #
 # One row, one package: the Host half (index.js) registers the send_email /
 # read_emails tools and the background IMAP poller; the browser half
-# (client.js) contributes the 「智能邮箱」 panel under settings.plugins.tab
-# for account and whitelist management through the plugin's own HTTP routes.
+# (client.js) contributes the "智能邮箱" panel under settings.plugins.tab for
+# accounts, whitelist, thread continuation, and log rotation.
+#
+# These are neutral defaults. Your own allowlist, workspace path, and wake
+# prompt belong in the profile's own cordis.patch.yml (same row id, last write
+# wins), or in the panel — never in this file.
 - insert:
     - id: smart-mail
       name: 'dsh-smart-mail'
       config:
-        # Wake behavior lives in config so it survives plugin reinstalls:
-        #   enabled   - the poller starts with the Host (default)
-        #   allowFrom - whitelist; empty means NO wake at all
-        #   model     - 'default' follows DSH's current default model; or a
-        #               concrete catalog id chosen in the panel
+        # Start the IMAP poller with the Host.
         enabled: true
+        # Seconds between polls (minimum 30).
         pollIntervalSec: 120
-        # allowFrom - whitelist; empty means NO wake at all. Add your own
-        # addresses here, or edit it later in the panel (settings -> plugins ->
-        # smart mail). Exact address `user@x.com` or domain suffix `@x.com`.
+        # Whichever senders are listed here may wake a session; an empty list
+        # means NO wake at all. Exact address (user@x.com) or domain suffix
+        # (@x.com).
         allowFrom: []
+        # 'default' follows DSH's current default model; or a concrete catalog id.
         model: default
-        wakePrompt: '邮件白名单唤醒：全自动处理这封新邮件。理解发件人意图后直接行动：需要回信就调用 send_email 直接发送，不需要逐字确认；拿不准的信息按邮件上下文合理推断，全程禁止使用 ask_user_question 反问用户；处理完成后用两三句话总结你做了什么即可。如果邮件是通知/广告类无实质内容，简短归档说明后直接结束。'
-        # wakeCwd - working directory for headless wake sessions; empty falls
-        # back to the DSH process cwd. Set your own workspace path in the
-        # panel or here, e.g. 'C:\Users\you\my-workspace'.
+        wakePrompt: '处理这封新邮件并按需回复。'
+        # Working directory for sessions this plugin creates. Empty falls back
+        # to the DSH process cwd; set your own workspace path here.
+        # ---- same-thread reply continuation ----
+        # Every outgoing message carries a [dsh-xxxx] subject tag; a reply is
+        # resolved back to its session by References/In-Reply-To first, then
+        # the X-DSH-Session header, then that tag.
+        tagPrefix: '[dsh-'
+        # Continue the thread's original session instead of starting a new one.
+        continueThreads: true
+        # If that session is running, replace its current turn before injecting.
+        interruptSameThread: true
+        # If that session was archived, restore it (workspaceRegistry) instead
+        # of abandoning the thread.
+        autoUnarchive: true
+        # ---- activity log rotation: split by size or by day ----
+        logMaxBytes: 2097152
+        logKeepDays: 7
+        logKeepFiles: 20

@@ -92,12 +92,43 @@ window.__ModuleLoader__.load({
         children)
     }
 
+    // One log line per record. The record shape is unchanged (`at` first, then
+    // `kind` plus event fields), so older lines still render; a few noisy kinds
+    // are folded to a single readable sentence instead of raw JSON.
+    function formatLogEntry(entry) {
+      const time = new Date(entry.at).toLocaleTimeString('zh-CN')
+      const rest = { ...entry, at: undefined, kind: undefined }
+      const kind = entry.kind ?? 'event'
+      let detail
+      if (kind === 'plugin-start') {
+        const d = entry.configDigest ?? {}
+        detail = `v${entry.version ?? '?'} · allowFrom ${d.allowFromCount ?? 0} 条 · 轮询 ${d.pollIntervalSec ?? '?'}s · 配置${entry.configChanged === 'first-run' ? '首次记录' : entry.configChanged ? '有变化' : '无变化'}`
+        if (Array.isArray(entry.changedFields) && entry.changedFields.length > 0) detail += ` · 变化: ${entry.changedFields.join(',')}`
+      } else if (kind === 'mail-seen') {
+        detail = `本轮 ${entry.fresh ?? 0} 封：非白名单 ${entry.blocked ?? 0}，其他跳过 ${entry.skipped ?? 0} · ${(entry.senders ?? []).map((s) => `${s.from}×${s.count}`).join(', ')}`
+      } else if (kind === 'mail-wake') {
+        detail = `${entry.ok ? '成功' : '失败'} · ${entry.route ?? '?'} · ${entry.from ?? '?'} · ${entry.subject ?? '(无主题)'}`
+        if (entry.sessionId) detail += ` · 会话 ${entry.sessionId}`
+        if (entry.mode) detail += ` · ${entry.mode}${entry.interrupted ? '(打断)' : ''}`
+        if (entry.unarchivePath) detail += ` · 归档恢复 ${entry.unarchivePath}`
+        if (entry.error) detail += ` · 错误 ${entry.error}`
+      } else {
+        detail = JSON.stringify(rest)
+      }
+      return `${time} [${kind}] ${detail}`
+    }
+
     function SmartMailPage() {
       const [status, setStatus] = useState(null)
       const [notice, setNotice] = useState(null)
       const [draft, setDraft] = useState({ preset: 'qq', label: '', address: '', authCode: '', imapHost: '', imapPort: 993, smtpHost: '', smtpPort: 465 })
       const [allowText, setAllowText] = useState('')
-      const [cfg, setCfg] = useState({ pollIntervalSec: 120, wakePrompt: '', wakeCwd: '', enabled: true })
+      const [cfg, setCfg] = useState({
+        pollIntervalSec: 120, wakePrompt: '', wakeCwd: '', enabled: true,
+        continueThreads: true, interruptSameThread: true, autoUnarchive: true,
+        logMaxBytes: 2097152, logKeepDays: 7, logKeepFiles: 20,
+      })
+      const [threads, setThreads] = useState(null)
 
       const refresh = useCallback(async () => {
         try {
@@ -110,10 +141,22 @@ window.__ModuleLoader__.load({
               pollIntervalSec: data.config.pollIntervalSec ?? 120,
               wakePrompt: data.config.wakePrompt ?? '',
               wakeCwd: data.config.wakeCwd ?? '',
+              continueThreads: data.config.continueThreads !== false,
+              interruptSameThread: data.config.interruptSameThread !== false,
+              autoUnarchive: data.config.autoUnarchive !== false,
+              logMaxBytes: data.config.logMaxBytes ?? 2097152,
+              logKeepDays: data.config.logKeepDays ?? 7,
+              logKeepFiles: data.config.logKeepFiles ?? 20,
             })
           }
         } catch (cause) {
           setNotice({ ok: false, text: `面板连不上 Host 路由：${cause instanceof Error ? cause.message : String(cause)}` })
+        }
+        try {
+          const data = await api('/threads')
+          if (data.ok) setThreads(data)
+        } catch {
+          setThreads(null)
         }
       }, [])
 
@@ -186,7 +229,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.page },
         h('h1', { style: styles.title }, '智能邮箱 dsh-smart-mail'),
         h('div', { style: styles.subtitle },
-          '多账号收发 + 白名单唤醒：只有 allowFrom 内发件人的新邮件会唤醒 DSH 会话，其余只静默记录。'),
+          '多账号收发 + 白名单唤醒：只有 allowFrom 内发件人的新邮件会唤醒 DSH 会话；同一邮件线程的回复会续接原会话（必要时先打断其当前轮次），已归档的会话会被自动拉回。'),
 
         notice === null ? null : h('div', {
           style: { ...styles.notice, ...(notice.ok ? styles.noticeOk : styles.noticeError) },
@@ -272,13 +315,83 @@ window.__ModuleLoader__.load({
             h('button', { style: styles.button, onClick: pollNow }, '立即轮询一次'),
             h('span', { style: styles.help }, '唤醒模型跟随 DSH 当前默认模型（会话不写死 model/selection），无需在此选择。'))),
 
+        // ---- thread continuation --------------------------------------
+        h('div', { style: styles.section },
+          h('h2', { style: styles.sectionTitle }, '邮件线程续接'),
+          h(Field, { label: '续接同一会话' },
+            h('div', { style: styles.switchWrap },
+              h('button', {
+                style: cfg.continueThreads ? styles.buttonPrimary : styles.button,
+                role: 'switch', 'aria-checked': cfg.continueThreads,
+                onClick: () => saveConfig({ continueThreads: !cfg.continueThreads }),
+              }, cfg.continueThreads ? '已启用' : '已停用'))),
+          h(Field, { label: '同线程打断' },
+            h('div', { style: styles.switchWrap },
+              h('button', {
+                style: cfg.interruptSameThread ? styles.buttonPrimary : styles.button,
+                role: 'switch', 'aria-checked': cfg.interruptSameThread,
+                onClick: () => saveConfig({ interruptSameThread: !cfg.interruptSameThread }),
+              }, cfg.interruptSameThread ? '已启用' : '已停用'))),
+          h(Field, { label: '归档会话拉回' },
+            h('div', { style: styles.switchWrap },
+              h('button', {
+                style: cfg.autoUnarchive ? styles.buttonPrimary : styles.button,
+                role: 'switch', 'aria-checked': cfg.autoUnarchive,
+                onClick: () => saveConfig({ autoUnarchive: !cfg.autoUnarchive }),
+              }, cfg.autoUnarchive ? '已启用' : '已停用'))),
+          h('div', { style: { ...styles.row, marginTop: -2 } },
+            h('div', { style: styles.label }),
+            h('span', { style: styles.help },
+              '同线程回复续接原会话；若该会话正在运行，先打断当前轮次再注入。已归档的会话会被拉回后继续使用（不新建会话）。'))),
+
+        // ---- log rotation ---------------------------------------------
+        h('div', { style: styles.section },
+          h('h2', { style: styles.sectionTitle }, '日志轮转'),
+          h(Field, { label: '单文件上限(KiB)' },
+            h('input', {
+              style: { ...styles.input, flex: '0 0 120px' }, type: 'number', min: 64,
+              value: Math.round(cfg.logMaxBytes / 1024),
+              onChange: (e) => setCfg((c) => ({ ...c, logMaxBytes: Math.max(64, Number(e.target.value) || 2048) * 1024 })),
+              onBlur: () => saveConfig({ logMaxBytes: cfg.logMaxBytes }),
+            })),
+          h(Field, { label: '保留天数' },
+            h('input', {
+              style: { ...styles.input, flex: '0 0 100px' }, type: 'number', min: 1, value: cfg.logKeepDays,
+              onChange: (e) => setCfg((c) => ({ ...c, logKeepDays: Math.max(1, Number(e.target.value) || 7) })),
+              onBlur: () => saveConfig({ logKeepDays: cfg.logKeepDays }),
+            })),
+          h(Field, { label: '最多归档数' },
+            h('input', {
+              style: { ...styles.input, flex: '0 0 100px' }, type: 'number', min: 1, value: cfg.logKeepFiles,
+              onChange: (e) => setCfg((c) => ({ ...c, logKeepFiles: Math.max(1, Number(e.target.value) || 20) })),
+              onBlur: () => saveConfig({ logKeepFiles: cfg.logKeepFiles }),
+            })),
+          h('div', { style: { ...styles.row, marginTop: -2 } },
+            h('div', { style: styles.label }),
+            h('span', { style: styles.help },
+              `当前策略：${status?.logHealth?.policy ?? '按大小或跨天切分，保留最近 7 天'}。切分发生在写入前，历史归档仍可在上面「活动日志」里看到。`))),
+
         // ---- log ------------------------------------------------------
         h('div', { style: styles.section },
           h('h2', { style: styles.sectionTitle }, '活动日志'),
+          h('div', { style: styles.help },
+            status?.logHealth?.policy ?? '按大小或跨天自动切分，保留最近 7 天。'),
+          h('div', { style: styles.help },
+            `当前文件 ${Math.round((status?.logHealth?.currentBytes ?? 0) / 1024)} KiB / 上限 ${Math.round((status?.logHealth?.maxBytes ?? 0) / 1024)} KiB · 归档 ${status?.logHealth?.archives ?? 0} 个`),
           h('div', { style: styles.log },
             (status?.log ?? []).length === 0
               ? '（暂无记录）'
-              : status.log.map((entry, i) => `${new Date(entry.at).toLocaleTimeString('zh-CN')} [${entry.kind}] ${JSON.stringify({ ...entry, at: undefined })}`).join('\n'))))
+              : status.log.map(formatLogEntry).join('\n'))),
+
+        // ---- threads ---------------------------------------------------
+        h('div', { style: styles.section },
+          h('h2', { style: styles.sectionTitle }, '邮件线程 → 会话映射'),
+          h('div', { style: styles.help },
+            `共 ${threads?.count ?? 0} 个线程（显示最近 50 个），已登记我方 Message-ID ${threads?.outgoingCount ?? 0} 条。回复这些线程会续接对应会话。`),
+          (threads?.threads ?? []).length === 0
+            ? h('div', { style: styles.help }, '（还没有线程）')
+            : h('div', { style: styles.log },
+              threads.threads.map((t) => `${t.tag} · 会话 ${t.sessionId} · 第 ${t.round ?? 0} 轮 · ${t.subject ?? '(无主题)'}`).join('\n'))))
     }
 
     function apply(ctx) {

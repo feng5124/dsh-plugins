@@ -73,16 +73,23 @@ function foldHeader(name, value) {
 }
 
 /** Build a complete MIME message. */
-export function buildMessage({ from, fromName, to, cc, subject, text, html }) {
+export function buildMessage({ from, fromName, to, cc, subject, text, html, messageId, inReplyTo, references, tag, receipt }) {
   const date = new Date().toUTCString()
-  const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@dsh-smart-mail>`
+  const id = messageId ?? `<${Date.now()}.${Math.random().toString(36).slice(2)}@dsh-smart-mail>`
   const headers = [
     foldHeader('From', fromName ? `${headerValue(fromName)} <${from}>` : from),
     foldHeader('To', to),
     cc ? foldHeader('Cc', cc) : null,
     foldHeader('Subject', subject ?? ''),
     `Date: ${date}`,
-    `Message-ID: ${messageId}`,
+    `Message-ID: ${id}`,
+    inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
+    Array.isArray(references) && references.length > 0 ? `References: ${references.join(' ')}` : null,
+    // Thread tag + receipt let a reply be attributed even when the client
+    // drops References; both are ours, and clients simply carry them along.
+    tag ? `X-DSH-Session: ${tag}` : null,
+    receipt ? `X-DSH-Receipt: ${receipt}` : null,
+    'Auto-Submitted: no',
     'MIME-Version: 1.0',
     html
       ? 'Content-Type: multipart/alternative; boundary="dsh-smart-mail-alt"'
@@ -116,6 +123,8 @@ export function buildMessage({ from, fromName, to, cc, subject, text, html }) {
 /**
  * Send one email over SMTP with AUTH LOGIN.
  * @param account resolved account {address, authCode, smtp:{host,port,tls}}
+ * @param message {to, cc?, subject, text, html?, messageId?, inReplyTo?, references?, tag?, receipt?}
+ * @returns {Promise<{ok: true, messageId: string}>}
  */
 export async function sendMail(account, message) {
   const smtp = account.smtp

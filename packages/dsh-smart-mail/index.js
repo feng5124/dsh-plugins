@@ -3,19 +3,29 @@
  *
  * One row contributes:
  *   - send_email / read_emails tools for the agent (SMTP/IMAP over the
- *     accounts configured in ~/.dsh/smart-mail/accounts.json or the panel);
- *   - a background IMAP poller that wakes a fresh DSH session ONLY for
- *     whitelisted (allowFrom) senders — everything else stays silent;
- *   - same-origin HTTP routes under /smart-mail/* used by the settings
- *     panel (accounts CRUD, config, log, test).
+ *     accounts configured in <dsh home>/smart-mail/accounts.json or the panel);
+ *   - a background IMAP poller that, for whitelisted senders only, either
+ *     wakes a fresh DSH session or **continues the session its mail thread is
+ *     already bound to** (interrupting that session's running turn first);
+ *   - same-origin HTTP routes under /smart-mail/* used by the settings panel
+ *     (accounts CRUD, config, log, test, thread table, log health).
  *
- * Wake = in-process sessionController.create + prompt (queue mode): no
- * external CLI, no window, and the new session follows DSH's current
- * default model because no model/selection is recorded for it.
+ * Thread continuation in one line: every message this plugin sends carries a
+ * thread tag in the subject plus a recorded Message-ID; an inbound reply is
+ * resolved back to that tag (References/In-Reply-To first, then the
+ * X-DSH-Session header, then the subject tag) and therefore back to its
+ * session — see threads.mjs for the resolution order and wake.mjs for the
+ * delivery/interrupt/archive-restore semantics.
+ *
+ * Logging is deliberately quiet: a start summary (full config only when it
+ * changed), one aggregate line per poll round for ignored mail, and a
+ * complete record for every wake attempt — including the mail headers needed
+ * to debug a failure. See store.mjs for the rotation policy.
  */
 
 import {
   PRESETS,
+  LOG_ROTATION,
   listAccounts,
   getAccount,
   saveAccount,
@@ -24,13 +34,41 @@ import {
   saveSeen,
   appendLog,
   readLog,
+  logStats,
+  rotateLog,
+  loadThreads,
+  bindThread,
+  bumpThreadRound,
+  recordOutgoing,
+  tagForOutgoing,
+  tagForSession,
+  sessionForTag,
+  getMessage,
+  putMessage,
+  loadLastConfig,
+  saveLastConfig,
   matchesAllowFrom,
 } from './store.mjs'
 import { sendMail } from './smtp.mjs'
-import { openMailbox, selectInbox, searchSince, fetchSummaries, extractAddress } from './imap.mjs'
-import { wakeWithMail } from './wake.mjs'
+import { openMailbox, selectInbox, searchSince, fetchSummaries, fetchThreaded, extractAddress, decodeMimeWord } from './imap.mjs'
+import {
+  THREAD_HEADER_FIELDS,
+  DEFAULT_TAG_PREFIX,
+  addressesIn,
+  headerValue,
+  messageIdsIn,
+  newMessageId,
+  newTag,
+  tagFromSubject,
+  tagSubject,
+  detectLoop,
+  resolveThread,
+  IgnoreReason,
+} from './threads.mjs'
+import { DeliveryMode, deliverToSession, sessionState, wakeWithMail } from './wake.mjs'
 
 const ROUTE = '/smart-mail'
+const PLUGIN_VERSION = '0.2.0'
 
 function json(res, status, value) {
   const body = JSON.stringify(value)
@@ -52,57 +90,380 @@ async function readBody(req) {
   }
 }
 
-/** Poll one account: fetch recent mails, dedupe by UID, wake on whitelist hits. */
-async function pollAccount(ctx, account, cfg) {
+/* ------------------------------------------------------------------ config */
+
+/** Effective config from the profile patch plus defaults. */
+function normalizeConfig(config) {
+  return {
+    enabled: config?.enabled !== false,
+    pollIntervalSec: Math.max(30, Number(config?.pollIntervalSec ?? 120)),
+    allowFrom: Array.isArray(config?.allowFrom) ? config.allowFrom.map(String) : [],
+    model: config?.model ?? 'default',
+    wakePrompt: config?.wakePrompt ?? '处理这封新邮件并按需回复。',
+    wakeCwd: config?.wakeCwd ?? process.cwd(),
+    tagPrefix: typeof config?.tagPrefix === 'string' && config.tagPrefix.length > 0 ? config.tagPrefix : DEFAULT_TAG_PREFIX,
+    // A reply inside a known thread replaces that session's running turn.
+    interruptSameThread: config?.interruptSameThread !== false,
+    // Continue the bound session instead of starting a new one.
+    continueThreads: config?.continueThreads !== false,
+    // Restore an archived thread session instead of abandoning the thread.
+    autoUnarchive: config?.autoUnarchive !== false,
+    logMaxBytes: Math.max(64 * 1024, Number(config?.logMaxBytes ?? LOG_ROTATION.maxBytes)),
+    logKeepDays: Math.max(1, Number(config?.logKeepDays ?? LOG_ROTATION.keepDays)),
+    logKeepFiles: Math.max(1, Number(config?.logKeepFiles ?? LOG_ROTATION.keepFiles)),
+  }
+}
+
+/** The rotation knobs `appendLog` takes. */
+function rotationOf(cfg) {
+  return { maxBytes: cfg.logMaxBytes, keepDays: cfg.logKeepDays, keepFiles: cfg.logKeepFiles }
+}
+
+/** Fields compared to decide whether the effective config really changed. */
+const CONFIG_FIELDS = [
+  'enabled',
+  'pollIntervalSec',
+  'allowFrom',
+  'model',
+  'wakePrompt',
+  'wakeCwd',
+  'tagPrefix',
+  'interruptSameThread',
+  'continueThreads',
+  'autoUnarchive',
+  'logMaxBytes',
+  'logKeepDays',
+  'logKeepFiles',
+]
+
+/** Which config fields differ between two effective configs. */
+function configDiff(previous, next) {
+  if (previous === null || previous === undefined) return null
+  const changed = []
+  for (const field of CONFIG_FIELDS) {
+    const left = previous[field]
+    const right = next[field]
+    const same = JSON.stringify(left) === JSON.stringify(right)
+    if (!same) changed.push(field)
+  }
+  return changed
+}
+
+/**
+ * A compact config digest for the start summary — never the whole config.
+ * Secrets are absent by construction (accounts live elsewhere), and the long
+ * wake prompt is reduced to its length.
+ */
+function configDigest(cfg) {
+  return {
+    enabled: cfg.enabled,
+    pollIntervalSec: cfg.pollIntervalSec,
+    allowFromCount: cfg.allowFrom.length,
+    allowFromSample: cfg.allowFrom.slice(0, 3),
+    model: cfg.model,
+    wakeCwd: cfg.wakeCwd,
+    wakePromptChars: String(cfg.wakePrompt ?? '').length,
+    tagPrefix: cfg.tagPrefix,
+    interruptSameThread: cfg.interruptSameThread,
+    continueThreads: cfg.continueThreads,
+    autoUnarchive: cfg.autoUnarchive,
+    log: { maxBytes: cfg.logMaxBytes, keepDays: cfg.logKeepDays, keepFiles: cfg.logKeepFiles },
+  }
+}
+
+/* ------------------------------------------------------------- prompt text */
+
+/** Model-facing prompt for one inbound message. */
+function renderPrompt(mail, cfg, extra) {
+  const lines = [
+    `[dsh-smart-mail] ${extra.isNew ? '新邮件（已为该线程创建新会话）' : `同一邮件线程的续接（第 ${extra.round} 轮）`}`,
+    `邮箱账号：${mail.account}`,
+    `发件人：${mail.from}`,
+    ...(mail.to ? [`收件人：${mail.to}`] : []),
+    ...(mail.cc ? [`抄送：${mail.cc}`] : []),
+    `主题：${mail.subject || '(无主题)'}`,
+    `线程标识：${mail.tag}`,
+    ...(mail.messageId ? [`Message-ID：${mail.messageId}`] : []),
+    ...(mail.inReplyTo ? [`In-Reply-To：${mail.inReplyTo}`] : []),
+    `时间：${new Date(mail.at || Date.now()).toLocaleString('zh-CN')}`,
+  ]
+  if (extra.interrupted) lines.push('（该会话上一轮正在运行，已按同线程回复规则打断，本封邮件优先处理。）')
+  lines.push('', `正文：`, mail.body || mail.preview || '(空)')
+  if (!extra.isNew) {
+    lines.push(
+      '',
+      '这是同一邮件线程的后续邮件，请沿用该会话已有的上下文继续处理，不要从头重述。',
+    )
+  }
+  lines.push(
+    '',
+    cfg.wakePrompt,
+    '如需回信，直接调用 send_email（带上 inReplyTo 或 threadTag 以保持同一线程）。',
+  )
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ polling */
+
+/** Sender summary for the batched mail-seen line: at most 5 entries. */
+function senderSummary(entries) {
+  const counts = new Map()
+  for (const entry of entries) {
+    const key = entry.from ?? '(unknown)'
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([from, count]) => ({ from, count }))
+}
+
+/**
+ * Poll one account: fetch new mail, resolve threads, wake or continue.
+ *
+ * Logging contract:
+ *   - non-allowlisted / duplicate / loop mail is aggregated into at most ONE
+ *     `mail-seen` line per poll round (and none at all when nothing arrived);
+ *   - every whitelisted message that is acted on produces one `mail-wake`
+ *     line with its full outcome and the headers needed to debug it.
+ */
+async function pollAccount(ctx, account, cfg, log) {
   const session = await openMailbox(account)
   try {
     await selectInbox(session)
     const uids = await searchSince(session, 2)
-    const summaries = await fetchSummaries(session, uids)
+    if (uids.length === 0) return { ok: true, fresh: 0, woke: [] }
+    const fetched = await fetchThreaded(session, uids, THREAD_HEADER_FIELDS)
     const seen = loadSeen()
     const seenMap = seen[account.id] ?? {}
     const fresh = []
-    for (const mail of summaries) {
+    for (const mail of fetched) {
       if (seenMap[mail.uid] !== undefined) continue
-      const allowed = matchesAllowFrom(mail.fromAddress, cfg.allowFrom ?? [])
-      seenMap[mail.uid] = {
-        at: Date.now(),
-        from: mail.fromAddress,
-        subject: mail.subject,
-        woke: allowed,
-      }
-      fresh.push({ ...mail, allowed })
+      const headers = mail.headers
+      const from = addressesIn(headerValue(headers, 'from') ?? '')[0] ?? null
+      const subject = decodeMimeWord(headerValue(headers, 'subject') ?? '') ?? null
+      const messageId = messageIdsIn(headerValue(headers, 'message-id') ?? '')[0] ?? null
+      const inReplyTo = messageIdsIn(headerValue(headers, 'in-reply-to') ?? '')[0] ?? null
+      const allowed = matchesAllowFrom(from, cfg.allowFrom)
+      seenMap[mail.uid] = { at: Date.now(), from, subject, allowed, messageId }
+      fresh.push({ uid: mail.uid, headers, from, subject, messageId, inReplyTo, preview: mail.preview, allowed })
     }
     seen[account.id] = seenMap
     saveSeen(seen)
-    const woke = []
+
+    if (fresh.length === 0) return { ok: true, fresh: 0, woke: [] }
+
+    const ignored = []
+    const acted = []
     for (const mail of fresh) {
       if (!mail.allowed) {
-        appendLog({ kind: 'mail-seen', account: account.id, from: mail.fromAddress, subject: mail.subject, woke: false })
+        ignored.push({ ...mail, reason: IgnoreReason.notAllowlisted })
         continue
       }
-      const result = await wakeWithMail(ctx, {
-        account: `${account.label}(${account.address})`,
-        from: mail.fromAddress,
-        subject: mail.subject,
-        preview: mail.preview,
-        at: Date.now(),
-      }, cfg)
-      appendLog({
-        kind: 'mail-wake',
+      const loopReason = detectLoop(mail.headers, { selfAddresses: [account.address], sender: mail.from })
+      if (loopReason !== undefined) {
+        ignored.push({ ...mail, reason: loopReason })
+        continue
+      }
+      // Duplicate detection is by Message-ID: a re-poll, a UIDVALIDITY reset,
+      // or the same mail delivered to two folders must not run twice.
+      const previous = mail.messageId === null ? undefined : getMessage(mail.messageId)
+      if (previous !== undefined && previous.stage === 'done') {
+        ignored.push({ ...mail, reason: 'duplicate', previousSessionId: previous.sessionId })
+        continue
+      }
+      acted.push(mail)
+    }
+
+    // One aggregate line per round; skipped entirely when nothing was ignored.
+    if (ignored.length > 0) {
+      const blocked = ignored.filter((entry) => entry.reason === IgnoreReason.notAllowlisted).length
+      log({
+        kind: 'mail-seen',
         account: account.id,
-        from: mail.fromAddress,
+        address: account.address,
+        fresh: fresh.length,
+        blocked,
+        skipped: ignored.length - blocked,
+        reasons: [...new Set(ignored.map((entry) => entry.reason))],
+        senders: senderSummary(ignored),
+        // Verifiability: the allowlist decision for each distinct sender is
+        // kept, so "was this sender really not whitelisted?" stays answerable.
+        decisions: [...new Map(ignored.map((entry) => [entry.from, entry.allowed])).entries()]
+          .slice(0, 5)
+          .map(([from, allowed]) => ({ from, allowlisted: allowed === true })),
+        sample: ignored.slice(0, 3).map((entry) => ({
+          from: entry.from,
+          subject: entry.subject,
+          uid: entry.uid,
+          messageId: entry.messageId,
+          reason: entry.reason,
+        })),
+      })
+    }
+
+    const woke = []
+    for (const mail of acted) {
+      const result = await handleMail(ctx, account, mail, cfg)
+      woke.push({
+        from: mail.from,
         subject: mail.subject,
+        route: result.route,
         ok: result.ok,
         sessionId: result.sessionId ?? null,
-        error: result.error ?? null,
       })
-      woke.push({ from: mail.fromAddress, subject: mail.subject, ok: result.ok, sessionId: result.sessionId ?? null })
     }
     return { ok: true, fresh: fresh.length, woke }
   } finally {
     session.close()
   }
+}
+
+/**
+ * Act on one allowlisted message: resolve its thread, then continue that
+ * session (interrupting it if needed) or start a new one.
+ *
+ * Always emits exactly one `mail-wake` record — success carries the session
+ * id and the delivery mode, failure carries the complete error plus the mail
+ * headers, which is what makes a failure debuggable after the fact.
+ */
+async function handleMail(ctx, account, mail, cfg) {
+  const lookupOutgoing = (messageId) => tagForOutgoing(messageId)
+  const lookupTag = (tag) => sessionForTag(tag)
+  const thread = resolveThread({
+    headers: mail.headers,
+    lookupOutgoing,
+    lookupTag,
+    tagPrefix: cfg.tagPrefix,
+  })
+
+  const base = {
+    kind: 'mail-wake',
+    account: account.id,
+    address: account.address,
+    from: mail.from,
+    to: (addressesIn(headerValue(mail.headers, 'to') ?? '') ?? []).slice(0, 5).join(',') || null,
+    cc: (addressesIn(headerValue(mail.headers, 'cc') ?? '') ?? []).slice(0, 5).join(',') || null,
+    subject: mail.subject,
+    messageId: mail.messageId,
+    inReplyTo: mail.inReplyTo,
+    referenceCount: messageIdsIn(headerValue(mail.headers, 'references') ?? '').length,
+    uid: mail.uid,
+    threadVia: thread.via,
+    tag: thread.tag ?? null,
+  }
+
+  let sessionId = cfg.continueThreads ? thread.sessionId : undefined
+  let route = 'new-session'
+  let rebind = null
+  let tag = thread.tag ?? tagFromSubject(mail.subject ?? '', cfg.tagPrefix)
+
+  // The thread resolved to a tag whose session is gone: rebind the tag to the
+  // new session deliberately (and say so) instead of silently splitting.
+  if (cfg.continueThreads && thread.sessionId !== undefined) {
+    const state = await sessionState(ctx, thread.sessionId)
+    if (state === 'missing') {
+      rebind = { reason: 'session-missing', previousSessionId: thread.sessionId }
+      sessionId = undefined
+    } else {
+      route = 'continue'
+    }
+  }
+
+  if (route === 'continue') {
+    const round = bumpThreadRound(tag)
+    const result = await deliverToSession(ctx, {
+      sessionId,
+      text: renderPrompt(mail, cfg, { isNew: false, round: round || 1, interrupted: false }),
+      mode: cfg.interruptSameThread ? DeliveryMode.interrupt : DeliveryMode.queue,
+    })
+    if (result.ok) {
+      putMessage(mail.messageId ?? `uid:${account.id}:${mail.uid}`, {
+        ...base,
+        sessionId,
+        tag,
+        stage: 'done',
+        route,
+        mode: result.mode,
+        interrupted: result.interrupted === true,
+        cancelUsed: result.cancelUsed === true,
+        unarchivePath: result.unarchivePath,
+      })
+      appendLog({
+        ...base,
+        ok: true,
+        route,
+        sessionId,
+        mode: result.mode,
+        interrupted: result.interrupted === true,
+        cancelUsed: result.cancelUsed === true,
+        wasRunning: result.wasRunning === true,
+        unarchivePath: result.unarchivePath ?? null,
+        round: round || 1,
+      }, rotationOf(cfg))
+      return { ok: true, sessionId, route }
+    }
+    appendLog({ ...base, ok: false, route, sessionId, error: result.error ?? 'unknown delivery failure' }, rotationOf(cfg))
+    return { ok: false, sessionId, route }
+  }
+
+  // ---- new session -------------------------------------------------------
+  // A brand-new thread needs its own tag now: it is the reply anchor, so the
+  // record, the prompt, and the outgoing mail must agree on it.
+  if (tag === undefined) tag = newTag(mail.messageId ?? `${account.id}:${mail.uid}`)
+  const wake = await wakeWithMail(ctx, {
+    account: `${account.label}(${account.address})`,
+    from: mail.from,
+    subject: mail.subject,
+    preview: mail.preview,
+    at: Date.now(),
+  }, { ...cfg, wakePrompt: renderPrompt(mail, cfg, { isNew: true, round: 1 }) })
+
+  if (!wake.ok) {
+    appendLog({
+      ...base,
+      tag,
+      ok: false,
+      route,
+      error: wake.error ?? 'session creation failed',
+      rebind,
+    }, rotationOf(cfg))
+    return { ok: false, route }
+  }
+
+  const bound = bindThread(tag, { sessionId: wake.sessionId, subject: mail.subject })
+  if (bound.rebound) {
+    // Keep the established binding; the new session is left unreferenced and
+    // the conflict is recorded instead of moving the thread.
+    appendLog({
+      ...base,
+      tag,
+      ok: true,
+      route,
+      sessionId: bound.previousSessionId,
+      rebind: { reason: 'tag-already-bound', previousSessionId: bound.previousSessionId, orphanSessionId: wake.sessionId },
+      warning: 'thread tag was already bound to another session; kept the original binding',
+    }, rotationOf(cfg))
+    return { ok: true, sessionId: bound.previousSessionId, route: 'continue-fallback' }
+  }
+
+  putMessage(mail.messageId ?? `uid:${account.id}:${mail.uid}`, {
+    ...base,
+    sessionId: wake.sessionId,
+    tag,
+    stage: 'done',
+    route,
+    rebind,
+  })
+  appendLog({
+    ...base,
+    ok: true,
+    route,
+    sessionId: wake.sessionId,
+    tag,
+    rebind,
+  }, rotationOf(cfg))
+  return { ok: true, sessionId: wake.sessionId, route }
 }
 
 /** Untrained JSON out: render the value as one text block. */
@@ -122,22 +483,67 @@ const plugin = {
   Config: undefined,
 
   apply(ctx, config) {
-    const cfg = {
-      enabled: config?.enabled !== false,
-      pollIntervalSec: Math.max(30, Number(config?.pollIntervalSec ?? 120)),
-      allowFrom: Array.isArray(config?.allowFrom) ? config.allowFrom : [],
-      model: config?.model ?? 'default',
-      wakePrompt: config?.wakePrompt ?? '处理这封新邮件并按需回复。',
-      wakeCwd: config?.wakeCwd ?? process.cwd(),
+    let liveConfig = normalizeConfig(config)
+
+    const log = (record) => appendLog(record, rotationOf(liveConfig))
+
+    /**
+     * Apply a rotation-policy change to the file that already exists.
+     *
+     * Rotation normally happens right before a write, but lowering the limit
+     * from the panel must take effect immediately — otherwise an oversized log
+     * would sit there until the next mail arrives. `rotateLog` writes its own
+     * `log-rotate` record into the fresh file, so the archive boundary stays
+     * self-describing.
+     */
+    const applyRotationNow = (reason) => rotateLog({ ...rotationOf(liveConfig), reason })
+
+    /** Resolve one account by id / label / address, or the only account. */
+    const pickAccount = (key) => {
+      const accounts = listAccounts()
+      if (accounts.length === 0) return { error: 'no account configured; add one in Settings → 智能邮箱', accounts }
+      if (key) {
+        const needle = String(key).toLowerCase()
+        const found = accounts.find((a) => a.id.toLowerCase() === needle || String(a.label).toLowerCase() === needle || a.address.toLowerCase() === needle) ?? null
+        return { account: found, accounts }
+      }
+      return { account: accounts.length === 1 ? accounts[0] : null, accounts }
     }
-    let liveConfig = { ...cfg }
+
+    /* ------------------------------------------------------- start summary */
+    // Rotate before the first line so a restart after a long pause still
+    // starts a fresh file, then record one line with a digest; the full
+    // config is written only when it changed.
+    rotateLog({ ...rotationOf(liveConfig), reason: 'startup' })
+    const previous = loadLastConfig()
+    const changed = configDiff(previous?.config ?? null, liveConfig)
+    log({
+      kind: 'plugin-start',
+      version: PLUGIN_VERSION,
+      pid: process.pid,
+      configDigest: configDigest(liveConfig),
+      configChanged: changed === null ? 'first-run' : changed.length > 0,
+      ...(changed !== null && changed.length > 0 ? { changedFields: changed } : {}),
+    })
+    if (changed === null || changed.length > 0) {
+      log({
+        kind: 'config-change',
+        reason: changed === null ? 'first-run' : 'startup',
+        changedFields: changed ?? CONFIG_FIELDS.slice(),
+        before: previous?.config ?? null,
+        after: liveConfig,
+      })
+    }
+    saveLastConfig(liveConfig)
 
     const applyTools = () => {
       ctx.effect(() => ctx.tools.register({
         name: 'send_email',
         description:
           'Send an email through a configured dsh-smart-mail account (SMTP, authorization-code auth). ' +
-          'Use it whenever the user asks to send mail; pick the account by id or label, or let the only configured account be the default.',
+          'Use it whenever the user asks to send mail; pick the account by id or label, or let the only configured account be the default. ' +
+          'To answer inside an existing mail thread, pass inReplyTo (the Message-ID you are replying to) or threadTag: the subject tag, ' +
+          'In-Reply-To and References headers are then set automatically so the reply continues that DSH session.',
         parameters: {
           type: 'object',
           properties: {
@@ -147,35 +553,59 @@ const plugin = {
             subject: { type: 'string', description: 'Email subject.' },
             text: { type: 'string', description: 'Plain-text body.' },
             html: { type: 'string', description: 'Optional HTML body (sent as alternative part).' },
+            inReplyTo: { type: 'string', description: 'Message-ID being answered, e.g. <abc@x.com>. Keeps the reply in the same thread.' },
+            threadTag: { type: 'string', description: 'Thread tag (e.g. a3f9). Defaults to the tag of the current session.' },
           },
           required: ['to', 'subject', 'text'],
         },
         output: jsonOut(),
-        async execute(args) {
-          const accounts = listAccounts()
-          if (accounts.length === 0) {
-            return { ok: false, error: 'no account configured; add one in Settings → 智能邮箱' }
-          }
-          let account = null
-          if (args.account) {
-            const key = String(args.account).toLowerCase()
-            account = accounts.find((a) => a.id.toLowerCase() === key || String(a.label).toLowerCase() === key || a.address.toLowerCase() === key) ?? null
-          } else if (accounts.length === 1) {
-            account = accounts[0]
-          }
+        async execute(args, exec) {
+          const picked = pickAccount(args.account)
+          if (picked.error) return { ok: false, error: picked.error }
+          const account = picked.account
           if (!account) {
-            return { ok: false, error: `account not found: ${args.account}`, accounts: accounts.map((a) => ({ id: a.id, label: a.label, address: a.address })) }
+            return { ok: false, error: `account not found: ${args.account}`, accounts: picked.accounts.map((a) => ({ id: a.id, label: a.label, address: a.address })) }
           }
+
+          // Thread identity: explicit tag, else the tag of this very session,
+          // else the tag our own outgoing table knows for the parent id.
+          const sessionId = exec?.agent?.id
+          const tag = args.threadTag
+            ? String(args.threadTag).trim().toLowerCase().replace(/^\[?dsh-?/i, '').replace(/\]$/, '')
+            : (tagForSession(sessionId) ?? tagForOutgoing(args.inReplyTo) ?? undefined)
+          const messageId = newMessageId(account.address)
+          const references = messageIdsIn(args.inReplyTo)
+          const subject = tag ? tagSubject(args.subject, tag, liveConfig.tagPrefix) : args.subject
+
           try {
             const result = await sendMail(account, {
-              to: args.to, cc: args.cc, subject: args.subject, text: args.text, html: args.html,
-              fromName: account.label,
+              to: args.to,
+              cc: args.cc,
+              subject,
+              text: args.text,
+              html: args.html,
+              messageId,
+              inReplyTo: args.inReplyTo,
+              references,
+              tag,
             })
-            appendLog({ kind: 'send', account: account.id, to: args.to, subject: args.subject, ok: true })
-            return { ok: true, ...result, account: account.address }
+            if (tag) recordOutgoing(messageId, tag)
+            log({
+              kind: 'send',
+              account: account.id,
+              to: args.to,
+              cc: args.cc ?? null,
+              subject,
+              ok: true,
+              messageId,
+              tag: tag ?? null,
+              inReplyTo: args.inReplyTo ?? null,
+              sessionId: sessionId ?? null,
+            })
+            return { ok: true, ...result, account: account.address, tag: tag ?? null, inReplyTo: args.inReplyTo ?? null }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            appendLog({ kind: 'send', account: account.id, to: args.to, subject: args.subject, ok: false, error: message })
+            log({ kind: 'send', account: account.id, to: args.to, subject, ok: false, error: message, tag: tag ?? null })
             return { ok: false, error: message }
           }
         },
@@ -184,7 +614,7 @@ const plugin = {
       ctx.effect(() => ctx.tools.register({
         name: 'read_emails',
         description:
-          'Read recent emails from a configured dsh-smart-mail account over IMAP (ENVELOPE summaries plus short body previews). ' +
+          'Read recent emails from a configured dsh-smart-mail account over IMAP (headers plus short body previews). ' +
           'Returns newest first; use account id/label to pick a mailbox and daysBack/query to narrow.',
         parameters: {
           type: 'object',
@@ -197,19 +627,11 @@ const plugin = {
         },
         output: jsonOut(),
         async execute(args) {
-          const accounts = listAccounts()
-          if (accounts.length === 0) {
-            return { ok: false, error: 'no account configured; add one in Settings → 智能邮箱' }
-          }
-          let account = null
-          if (args.account) {
-            const key = String(args.account).toLowerCase()
-            account = accounts.find((a) => a.id.toLowerCase() === key || String(a.label).toLowerCase() === key || a.address.toLowerCase() === key) ?? null
-          } else if (accounts.length === 1) {
-            account = accounts[0]
-          }
+          const picked = pickAccount(args.account)
+          if (picked.error) return { ok: false, error: picked.error }
+          const account = picked.account
           if (!account) {
-            return { ok: false, error: `account not found: ${args.account}`, accounts: accounts.map((a) => ({ id: a.id, label: a.label, address: a.address })) }
+            return { ok: false, error: `account not found: ${args.account}`, accounts: picked.accounts.map((a) => ({ id: a.id, label: a.label, address: a.address })) }
           }
           const daysBack = Math.min(30, Math.max(1, Number(args.daysBack ?? 3)))
           const limit = Math.min(30, Math.max(1, Number(args.limit ?? 10)))
@@ -250,9 +672,9 @@ const plugin = {
         busy = true
         for (const account of listAccounts()) {
           try {
-            await pollAccount(ctx, account, liveConfig)
+            await pollAccount(ctx, account, liveConfig, log)
           } catch (error) {
-            appendLog({
+            log({
               kind: 'poll-error',
               account: account.id,
               error: error instanceof Error ? error.message : String(error),
@@ -282,7 +704,28 @@ const plugin = {
                 id: a.id, label: a.label, address: a.address, preset: a.preset,
                 imap: a.imap, smtp: a.smtp, authCodeTail: a.authCode ? `${a.authCode.slice(0, 2)}***(${a.authCode.length})` : '',
               }))
-              json(res, 200, { ok: true, config: liveConfig, presets: PRESETS, accounts, log: readLog(60) })
+              json(res, 200, {
+                ok: true,
+                version: PLUGIN_VERSION,
+                config: liveConfig,
+                presets: PRESETS,
+                accounts,
+                log: readLog(60),
+                logHealth: logStats(rotationOf(liveConfig)),
+              })
+              return
+            }
+            if (route === '/threads' && req.method === 'GET') {
+              const threads = loadThreads()
+              json(res, 200, {
+                ok: true,
+                count: Object.keys(threads.byTag).length,
+                outgoingCount: Object.keys(threads.outgoing).length,
+                threads: Object.entries(threads.byTag)
+                  .sort((a, b) => (b[1]?.updatedAt ?? 0) - (a[1]?.updatedAt ?? 0))
+                  .slice(0, 50)
+                  .map(([tag, record]) => ({ tag, ...record })),
+              })
               return
             }
             if (route === '/account' && req.method === 'POST') {
@@ -314,23 +757,46 @@ const plugin = {
             }
             if (route === '/config' && req.method === 'POST') {
               const body = await readBody(req)
-              liveConfig = {
+              const before = { ...liveConfig }
+              liveConfig = normalizeConfig({
                 ...liveConfig,
                 ...(body.enabled !== undefined ? { enabled: Boolean(body.enabled) } : {}),
-                ...(body.pollIntervalSec !== undefined ? { pollIntervalSec: Math.max(30, Number(body.pollIntervalSec) || 120) } : {}),
+                ...(body.pollIntervalSec !== undefined ? { pollIntervalSec: body.pollIntervalSec } : {}),
                 ...(Array.isArray(body.allowFrom) ? { allowFrom: body.allowFrom.map(String) } : {}),
                 ...(body.model !== undefined ? { model: String(body.model) } : {}),
                 ...(body.wakePrompt !== undefined ? { wakePrompt: String(body.wakePrompt) } : {}),
                 ...(body.wakeCwd !== undefined ? { wakeCwd: String(body.wakeCwd) } : {}),
+                ...(body.tagPrefix !== undefined ? { tagPrefix: String(body.tagPrefix) } : {}),
+                ...(body.interruptSameThread !== undefined ? { interruptSameThread: Boolean(body.interruptSameThread) } : {}),
+                ...(body.continueThreads !== undefined ? { continueThreads: Boolean(body.continueThreads) } : {}),
+                ...(body.autoUnarchive !== undefined ? { autoUnarchive: Boolean(body.autoUnarchive) } : {}),
+                ...(body.logMaxBytes !== undefined ? { logMaxBytes: body.logMaxBytes } : {}),
+                ...(body.logKeepDays !== undefined ? { logKeepDays: body.logKeepDays } : {}),
+                ...(body.logKeepFiles !== undefined ? { logKeepFiles: body.logKeepFiles } : {}),
+              })
+              const changedNow = configDiff(before, liveConfig) ?? []
+              // A rotation-policy change applies to the existing file at once,
+              // before this call's own record is written under the new limit.
+              const rotationChanged = changedNow.some((field) => field.startsWith('log'))
+              if (rotationChanged) applyRotationNow('config-panel')
+              if (changedNow.length > 0) {
+                log({
+                  kind: 'config-change',
+                  reason: 'panel',
+                  changedFields: changedNow,
+                  before,
+                  after: liveConfig,
+                })
+                saveLastConfig(liveConfig)
               }
-              json(res, 200, { ok: true, config: liveConfig })
+              json(res, 200, { ok: true, config: liveConfig, changedFields: changedNow })
               return
             }
             if (route === '/poll-now' && req.method === 'POST') {
               const results = []
               for (const account of listAccounts()) {
                 try {
-                  results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig)) })
+                  results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig, log)) })
                 } catch (error) {
                   results.push({ account: account.id, ok: false, error: error instanceof Error ? error.message : String(error) })
                 }
@@ -349,10 +815,8 @@ const plugin = {
     applyTools()
     ctx.effect(applyPoller(), 'smart-mail: poller')
     applyRoutes()
-
-    appendLog({ kind: 'plugin-start', config: { ...liveConfig } })
   },
 }
 
 export default plugin
-export { PRESETS, ROUTE }
+export { PRESETS, ROUTE, LOG_ROTATION }
