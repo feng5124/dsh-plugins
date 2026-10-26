@@ -71,10 +71,13 @@
       },
       "versions": [
         {
-          "version": "0.1.0",
-          "publishTimestamp": 1792890187,
+          "version": "0.2.0",
+          "publishTimestamp": 1793028160,
           "source": {
-            "type": "npm"
+            "type": "git",
+            "url": "https://github.com/feng5124/dsh-plugins",
+            "commit": "9487d5b2eebf7961551f7c8c31d2c42db3f9cedc",
+            "path": "packages/dsh-smart-mail"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
@@ -113,9 +116,12 @@
       "versions": [
         {
           "version": "1.0.0",
-          "publishTimestamp": 1792890228,
+          "publishTimestamp": 1793028160,
           "source": {
-            "type": "npm"
+            "type": "git",
+            "url": "https://github.com/feng5124/dsh-plugins",
+            "commit": "9487d5b2eebf7961551f7c8c31d2c42db3f9cedc",
+            "path": "packages/dsh-plugin-headless-sessions-panel"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
