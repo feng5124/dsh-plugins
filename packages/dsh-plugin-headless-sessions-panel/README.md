@@ -9,9 +9,29 @@
 
 | 会话状态 | 面板右侧 |
 |---|---|
-| 在客户端目录里 | **「打开会话」** |
-| **已归档**（登记表里有、摘要里没有） | **「取消归档并打开」**：`workspaces.unarchiveSession(id)` → 刷新目录 → `openSession(id)` |
+| **已归档**（**优先判断**，哪怕它同时也在目录里） | **「取消归档并打开」**：`workspaces.unarchiveSession(id)` → 刷新目录 → `openSession(id)` |
+| 在客户端目录里、未归档 | **「打开会话」** |
 | 目录里还没有（外部进程刚建） | 「暂时只读」+ **「刷新目录并打开」**：先让客户端重拉 `session/list`，宿主认识了就打开 |
+
+> **2026-10-30 修的归档 bug**：归档判断必须排在最前。宿主 `session/list` **不**过滤归档会话
+> （只有 GUI 的分组界面才隐藏它们），所以已归档的会话几乎总是同时"known"。旧代码先判断 `known`，
+> 于是归档会话被渲染成普通的「打开会话」：点下去**看起来打开了**，但 id 仍留在 `archivedSessionIds` 里，
+> 客户端 `ui-workspace` 的 `clearArchivedCurrent()`（`dsh-client-ui-workspace/lib/client.js`）在下一个
+> Workspace 帧到达时把主视图清掉 —— 表现就是「打开成功，几十秒后自己消失」。
+> 本机实测：156 条归档会话里 **77 条**同时还在工作区 `sessionIds` 里，这 77 条全都会踩到。
+> 修法：`classifySession` 先判归档；`openSession` 增加兜底重定向（除 `afterUnarchive` 重试外一律先取消归档）。
+
+**行标题（2026-10-30）**：无头会话的文件名全是 `session-<uuid>`，只看 id 无法分辨。扫描器现在
+**总是**解析首部，输出 `title` / `titleSource` / `firstText` / `displayTitle`：
+
+- `displayTitle` = 真标题（用户改名、模型生成）；DSH 自己那个 `source.kind === 'fallback'` 的标题
+  是**按字节截断的前缀**（`fallbackSessionTitle`，中文没空格等于硬截，例如「用无头会话插件打开一个已归」），
+  所以遇到 fallback 就改用**用户首句话**。两者都没有才回落到短 id。
+- 首句取自第一条 `user/message`（`source.kind === 'user'`），跳过注入的 `<system-reminder>` /
+  `Current runtime context` 之类上下文。
+
+归档集合读的是 `workspaces.model.archivedSessionIds`（**不是服务本身的属性**）——2026-10-08 修过一次：
+读错属性会恒为 `undefined`，导致归档会话也被显示成"只读"且没有取消归档入口。
 
 **目录里为什么"还没有"**（2026-10-08 实测）：宿主在启动时扫一遍会话目录建立目录，之后**别的进程**
 （21:30 的日报无头任务）新建的会话，要等客户端重新拉一次 `remote.session.list({})` 才进目录 ——
@@ -74,22 +94,12 @@ GET /headless-sessions/dump?id=<id前缀>   把某个会话导出成 Markdown（
 - `host-stamp.json` —— 每次宿主半加载时写一次（含 `hostNode` / `electron` / 脚本路径），用来确认"新代码有没有真的加载"；
 - `last-request.json` —— 路由被访问时写（1 秒节流），用来确认"页面有没有真的连上宿主"。
 
-## 安装
+## 安装（本机 desktop profile）
 
-**方式一（npm 包名）**：
-
+```powershell
+# 用插件管理器装（等价于 pnpm add + 选入 dsh.profile.bundles）
+#   plugin_manager install_bundle target=dsh-plugin-headless-sessions-panel
 ```
-plugin_manager install_bundle target=dsh-plugin-headless-sessions-panel
-```
-
-**方式二（本地目录）**：克隆/下载本仓库后安装目录：
-
-```
-plugin_manager install_bundle target=<path-to>/dsh-plugin-headless-sessions-panel
-```
-
-自 1.0.0 起取证脚本 `lib/find-headless.mjs` 随包内置，npm 安装后开箱即用；
-仍可用 `DSH_HEADLESS_FORENSICS` 指定外部脚本、`DSH_BUNDLED_NODE` 指定解释器。
 
 装完检查：
 
@@ -114,8 +124,7 @@ Get-Content "$env:USERPROFILE\.dsh\headless-sessions\host-stamp.json" -Raw
 ```powershell
 # 零依赖：注册、轮询、列表排序、转录预览、错误分支、Markdown 解析
 node test/smoke.mjs
-```
 
-更重的渲染/宿主联调脚本保留在本机开发环境，不随包分发。
+```
 
 `package.json` 只声明 `dsh.bundle` 与 `dsh.client`，没有依赖；`lib/index.mjs` 是历史兼容 shim。

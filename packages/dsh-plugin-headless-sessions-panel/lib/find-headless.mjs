@@ -2,7 +2,7 @@
 // find-headless.mjs — 在本机找出 DSH 的「无头（headless）」会话，以及最近活动过的会话。
 //
 // 背景（2026-10-07 取证所得）：
-//   1) 无头会话的会话文件在 ~/.dsh/sessions/<工作区编码目录>\session-<uuid>\session.v4.jsonl.zstd
+//   1) 无头会话的会话文件在 ~/.dsh/sessions/<工作区编码目录>/session-<uuid>/session.v4.jsonl.zstd
 //      文件名固定 session.v4.jsonl.zstd，内容是 **多帧追加** 的 zstd；Node 的 zstdDecompressSync
 //      只解第一帧，所以本脚本按帧边界贪心解码。
 //   2) 会话文件的 mtime 一直在涨 = 那个会话正在跑；会话首行 JSON 里有 {id, cwd, createdAt}。
@@ -119,14 +119,45 @@ function readSession(file) {
   };
 }
 
-function tailInfo(s) {
-  const info = { goal: null, title: null, last: null, lastAt: null, lastTool: null, events: 0 };
+/** Flatten one event `content` payload to plain text. */
+function textOf(c) {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((x) => (typeof x === "string" ? x : (x?.text ?? ""))).join("\n");
+  return "";
+}
+
+// 首部信息（便宜：只解前 30 帧）。标题来自 `session/title`；没有标题时用**用户发的首句话**
+// 兜底 —— 无头会话的名字全是 `session-<uuid>`，光看 id 无法分辨（2026-10-30 用户要求）。
+//
+// 注意 `source.kind`：DSH 自己的兜底标题是**截断过的**（`fallbackSessionTitle` 按
+// fallbackMaxWords/fallbackMaxBytes 裁剪，中文没有空格所以等于截断字节），
+// 例如「用无头会话插件打开一个已归」。这种截断标题不如完整的首句话好认，所以
+// displayTitle 优先用「真标题」（用户改名 / 模型生成），兜底标题时改用首句话。
+function headInfo(s) {
+  const info = { goal: null, title: null, titleSource: null, firstText: null, events: 0 };
   const early = decodeFrames(s.buf, s.starts, 0, Math.min(30, s.starts.length));
   for (const e of parseLines(early.text)) {
-    if (e.type === "goal/change" && e.data?.goal?.objective) info.goal = e.data.goal.objective;
-    if (e.type === "session/title" && e.data?.title) info.title = e.data.title;
-    if (e.type === "user/message" && e.data?.source?.kind === "user") info.events++;
+    if (e.type === "goal/change" && info.goal === null && e.data?.goal?.objective) info.goal = e.data.goal.objective;
+    if (e.type === "session/title" && info.title === null && e.data?.title) {
+      info.title = e.data.title;
+      info.titleSource = e.data?.source?.kind ?? null;
+    }
+    if (e.type === "user/message" && e.data?.source?.kind === "user") {
+      info.events++;
+      if (info.firstText === null) {
+        const body = textOf(e.data.content).replace(/\s+/g, " ").trim();
+        // 注入的运行时上下文不是用户说的话，别拿它当名字。
+        if (body && !/^<system-reminder>/.test(body) && !/Current runtime context/.test(body)) {
+          info.firstText = body.slice(0, 120);
+        }
+      }
+    }
   }
+  return info;
+}
+
+function tailInfo(s) {
+  const info = { last: null, lastAt: null, lastTool: null };
   // 从文件末尾往回找最后几个完整帧
   const collected = [];
   for (let k = s.starts.length - 1; k >= 0 && collected.length < 5; k--) {
@@ -268,7 +299,17 @@ const rows = has("--all")
   : [...new Set([...running, ...live])].sort((a, b) => b.mtime - a.mtime);
 
 const detailed = has("--full") || !has("--all");
-const enriched = rows.map((s) => ({ ...s, ...(detailed ? tailInfo(s) : {}) }));
+// 首部（标题/目标/首句）总是解：它是面板「名字」的唯一来源，`--all --json` 也要。
+const enriched = rows.map((s) => ({ ...s, ...headInfo(s), ...(detailed ? tailInfo(s) : {}) }));
+/**
+ * Final display name. A true title (user rename / model-generated) wins; DSH's
+ * deterministic `fallback` title is a byte-truncated prefix, so the full first
+ * sentence of the user reads better for telling sessions apart.
+ */
+const displayName = (s) => {
+  if (s.title && s.titleSource !== "fallback") return s.title;
+  return s.firstText ?? s.title ?? null;
+};
 
 if (has("--json")) {
   console.log(
@@ -284,7 +325,13 @@ if (has("--json")) {
         pid: s.pid ?? null,
         running: Boolean(s.pid),
         activeRecently: now - s.mtime < LIVE_MS,
+        // `title` 是会话自带的标题；`titleSource` 说明它从哪来（`fallback` = DSH
+        // 自己按字节截断的前缀，不好认）。`firstText` 是用户首句话。
+        // `displayTitle` 是二者合一后的最终名字，面板直接用它当行标题。
         title: s.title ?? null,
+        titleSource: s.titleSource ?? null,
+        firstText: s.firstText ?? null,
+        displayTitle: displayName(s),
         goal: s.goal ?? null,
         lastText: s.last ?? null,
         lastTool: s.lastTool ?? null,
@@ -312,10 +359,12 @@ if (!enriched.length) {
       : now - s.mtime < LIVE_MS
         ? "ACTIVE  无运行中无头进程（交互会话在写，或刚退出）"
         : "idle";
-    console.log(`- ${tag}  ${s.id}`);
+    console.log(`- ${tag}  ${displayName(s) ?? "(无标题)"}  ${s.id}`);
     console.log(`    cwd       : ${s.cwd}`);
     console.log(`    起于      : ${local(s.createdAt)}    文件更新: ${local(s.mtime)} (${ago(s.mtime)})   压缩 ${(s.size / 1024).toFixed(0)} KiB`);
-    if (s.title) console.log(`    标题      : ${s.title}`);
+    if (s.title && s.titleSource !== "fallback") console.log(`    标题      : ${s.title}`);
+    if (s.firstText) console.log(`    首句(名)  : ${s.firstText}`);
+    else if (s.title) console.log(`    标题(截断): ${s.title}`);
     if (s.goal) console.log(`    目标      : ${s.goal.replace(/\s+/g, " ").slice(0, 200)}`);
     if (s.lastTool || s.last) console.log(`    最近动作  : ${s.lastTool ?? "?"}${s.last ? " — " + s.last : ""}`);
     console.log(`    文件      : ${s.file}`);

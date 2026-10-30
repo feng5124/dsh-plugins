@@ -108,23 +108,30 @@ let statusBody = {
   ok: true,
   all: false,
   scope: '正在运行的无头会话 + 最近 5 分钟内活动过的会话',
-  script: '/opt/dsh-tools/find-headless.mjs',
+  script: 'E:/ws/dsh-session-forensics/find-headless.mjs',
   generatedAt: Date.parse('2026-10-07T17:00:00+08:00'),
   sessions: [
     {
-      id: 'session-idle-2222', cwd: 'C:/tmp/demo-workspace', createdAt: Date.parse('2026-10-07T16:00:00+08:00'),
+      id: 'session-idle-2222', cwd: 'E:\\冯诺依曼工作区', createdAt: Date.parse('2026-10-07T16:00:00+08:00'),
       lastWrite: Date.parse('2026-10-07T16:50:00+08:00'), size: 1024, pid: null, running: false,
       activeRecently: true, title: '已结束的会话', goal: null, lastText: '收尾', lastTool: 'bash',
     },
     {
-      id: 'session-run-1111', cwd: 'C:/tmp/demo-workspace', createdAt: Date.parse('2026-10-07T16:30:00+08:00'),
+      id: 'session-run-1111', cwd: 'E:\\deepseek-harness\\default-workspace', createdAt: Date.parse('2026-10-07T16:30:00+08:00'),
       lastWrite: Date.parse('2026-10-07T17:00:00+08:00'), size: 2048, pid: 12345, running: true,
       activeRecently: true, title: null, goal: null, lastText: '正在扫描', lastTool: 'grep',
     },
     {
-      id: 'session-foreign-3333', cwd: 'C:/tmp/demo-workspace-alt', createdAt: Date.parse('2026-10-07T15:00:00+08:00'),
+      id: 'session-foreign-3333', cwd: 'E:\\冯诺依曼工作区', createdAt: Date.parse('2026-10-07T15:00:00+08:00'),
       lastWrite: Date.parse('2026-10-07T15:30:00+08:00'), size: 512, pid: null, running: false,
       activeRecently: false, title: '外部无头会话', goal: null, lastText: null, lastTool: null,
+    },
+    {
+      // The 2026-10-30 regression shape: present in session/list AND archived.
+      id: 'session-both-4444', cwd: 'E:\\deepseek-harness\\default-workspace', createdAt: Date.parse('2026-10-07T14:00:00+08:00'),
+      lastWrite: Date.parse('2026-10-07T14:30:00+08:00'), size: 640, pid: null, running: false,
+      activeRecently: false, title: null, firstText: '帮我修复这个归档 bug', displayTitle: '帮我修复这个归档 bug',
+      goal: null, lastText: null, lastTool: null,
     },
   ],
 }
@@ -158,6 +165,7 @@ const registrations = []
 const openedSessions = []
 const unarchivedSessions = []
 let refreshCalls = 0
+let archivedIds = ['session-idle-2222', 'session-both-4444']
 const ctx = {
   slots: {
     inject: (slot, factory) => factory(),
@@ -166,20 +174,35 @@ const ctx = {
   effect: (callback) => callback(),
   get: (name) => {
     if (name === 'uiWorkspace') return { openSession: (id) => openedSessions.push(id) }
-    // Only the running session is in the client's own catalogue; session-idle-2222
-    // is archived (membership kept, dropped from the catalogue), session-foreign-3333
-    // stands for a session another process/profile created.
+    // `session-both-4444` reproduces the 2026-10-30 bug: the Host's session/list
+    // does NOT filter archived Sessions, so it is in the catalogue AND in the
+    // archive set at the same time. `session-idle-2222` is archived and absent
+    // from the catalogue; `session-foreign-3333` stands for a session another
+    // process/profile created.
     if (name === 'sessions') {
       return {
-        list: { getSnapshot: () => ({ byId: { 'session-run-1111': { id: 'session-run-1111' } } }) },
+        list: {
+          getSnapshot: () => ({
+            byId: {
+              'session-run-1111': { id: 'session-run-1111' },
+              'session-both-4444': { id: 'session-both-4444' },
+            },
+          }),
+        },
         manager: { refreshList: async () => { refreshCalls += 1 } },
       }
     }
     if (name === 'workspaces') {
       return {
         // The archive set lives on the client workspace model, not the service.
-        model: { archivedSessionIds: ['session-idle-2222'] },
-        unarchiveSession: async (id) => { unarchivedSessions.push(id); return { ok: true, value: {} } },
+        model: { archivedSessionIds: [...archivedIds] },
+        unarchiveSession: async (id) => {
+          unarchivedSessions.push(id)
+          // The real client installs the Host's new archive set on the reply.
+          const at = archivedIds.indexOf(id)
+          if (at >= 0) archivedIds.splice(at, 1)
+          return { ok: true, value: { archivedSessionIds: [...archivedIds] } }
+        },
       }
     }
     return undefined
@@ -238,7 +261,7 @@ assert.ok(REQUESTS.some((url) => url === '/headless-sessions/status'), 'the pane
 assert.ok(text.includes('运行中的无头会话 1 个'), `subtitle counts running sessions: ${text.slice(0, 200)}`)
 assert.ok(text.includes('运行中 pid=12345'), 'the running session carries a running badge with its pid')
 assert.ok(text.includes('最近活动'), 'the non-running session is labelled as recently active')
-assert.ok(text.includes('C:/tmp/demo-workspace'), 'the cwd is shown')
+assert.ok(text.includes('E:\\deepseek-harness\\default-workspace'), 'the cwd is shown')
 // Running sessions sort first, and the first row is auto-opened.
 assert.ok(REQUESTS.some((url) => url.startsWith('/headless-sessions/dump?id=session-run-1111')), 'the first running session is auto-opened')
 assert.ok(text.includes('跑一下'), 'the exported transcript is rendered')
@@ -270,6 +293,32 @@ const unarchiveButton = findAll(tree2, (node) => node.type === 'button' && textO
 unarchiveButton.props.onClick()
 await new Promise((resolve) => setTimeout(resolve, 800))
 assert.deepEqual(unarchivedSessions, ['session-idle-2222'], 'unarchive targets the selected session')
+
+// ---- 2026-10-30 regression: archived AND in the catalogue ------------------
+// The Host's session/list does not filter archived Sessions, so an archived
+// row is also "known". Classifying "known" first produced a plain 「打开会话」
+// button: it opened, then the client's clearArchivedCurrent() dropped the main
+// view again ~30s later. Archived must win over known.
+const bothRow = findAll(tree2, (node) => node.type === 'button' && textOf(node).join('').includes('帮我修复这个归档 bug'))[0]
+assert.ok(bothRow, 'the archived-but-known session row exists')
+assert.ok(!textOf(bothRow).join('').includes('session-both'), 'the row shows its name, not just the id')
+bothRow.props.onClick()
+await new Promise((resolve) => setTimeout(resolve, 0))
+const treeBoth = await settle(main.component, {})
+const bothText = textOf(treeBoth).join('\n')
+assert.ok(bothText.includes('取消归档并打开'),
+  `an archived session that is ALSO in the catalogue still offers unarchive-and-open: ${bothText.slice(0, 300)}`)
+assert.equal(findAll(treeBoth, (node) => node.type === 'button' && textOf(node).join('') === '打开会话').length, 0,
+  'no plain open button for an archived session, even when the catalogue knows it')
+const bothUnarchive = findAll(treeBoth, (node) => node.type === 'button' && textOf(node).join('') === '取消归档并打开')[0]
+assert.ok(bothUnarchive, 'the archived-but-known row exposes the unarchive action')
+const openedBeforeBoth = openedSessions.length
+bothUnarchive.props.onClick()
+await new Promise((resolve) => setTimeout(resolve, 800))
+assert.ok(unarchivedSessions.includes('session-both-4444'), 'unarchive targets the archived-but-known session')
+assert.ok(openedSessions.length > openedBeforeBoth, 'after unarchiving, the session is opened')
+assert.equal(openedSessions.filter((id) => id === 'session-both-4444').length, 1,
+  'the session is opened exactly once (no unarchive/open loop)')
 
 // A session from another process/profile is offered read-only instead of a broken button.
 const foreignRow = findAll(tree2, (node) => node.type === 'button' && textOf(node).join('').includes('外部无头会话'))[0]

@@ -78,20 +78,17 @@ function run(file, args, env) {
 }
 
 /**
- * The forensic scanner, best candidate first. Since 1.0.0 the script ships
- * inside this package (`lib/find-headless.mjs`), so npm installs work out of
- * the box; workspace/neighbour and user-level copies still win when present.
+ * The forensic script shipped beside this workspace's other tooling.
  * @returns candidate absolute paths, best first.
  */
 function scriptCandidates() {
   const here = path.dirname(fileURLToPath(import.meta.url))
   const candidates = [
     process.env.DSH_HEADLESS_FORENSICS,
-    // bundled fallback: shipped inside this package (npm installs resolve here)
-    path.join(here, 'find-headless.mjs'),
     // <workspace>/dsh-local-bundles/dsh-plugin-headless-sessions-panel/lib -> <workspace>/dsh-session-forensics
     path.resolve(here, '..', '..', '..', 'dsh-session-forensics', 'find-headless.mjs'),
     path.join(homedir(), '.dsh', 'headless-sessions', 'find-headless.mjs'),
+    'E:\\deepseek-harness\\default-workspace\\dsh-session-forensics\\find-headless.mjs',
   ]
   return candidates.filter((candidate) => typeof candidate === 'string' && candidate !== '' && existsSync(candidate))
 }

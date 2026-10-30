@@ -168,6 +168,20 @@ window.__ModuleLoader__.load({
       return `${(size / 1024 / 1024).toFixed(1)} MB`
     }
 
+    /**
+     * A session's human name. Headless runs are all `session-<uuid>`, so the id
+     * alone cannot tell two of them apart. Order: the scanner's resolved
+     * `displayTitle` (Session title, else the user's first sentence), then the
+     * raw title, then the first sentence, and only then a shortened id.
+     */
+    function nameOf(session) {
+      const pick = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : null)
+      const name = pick(session?.displayTitle) ?? pick(session?.title) ?? pick(session?.firstText)
+      if (name !== null) return name
+      const id = typeof session?.id === 'string' ? session.id : ''
+      return id === '' ? '(无标题会话)' : `${id.slice(0, 8)}…`
+    }
+
     /** Same-origin GET returning JSON, folding every failure into a value. */
     async function getJson(url, signal) {
       let response
@@ -514,10 +528,10 @@ window.__ModuleLoader__.load({
           return null
         }
       }
-      // NOTE (2026-10-07): a one-shot `ensureWorkspaceFor(...)` ran here once
-      // during development. The plugin no longer creates workspaces on its own
-      // — the panel exposes the same action as a button on any session whose
-      // folder has no workspace.
+      // NOTE (2026-10-07): a one-shot `ensureWorkspaceFor('E:\\冯诺依曼工作区')` ran here
+      // once, on request, and created that workspace (store id a77754b7-…). The
+      // plugin no longer creates workspaces on its own — the panel exposes the
+      // same action as a button on any session whose folder has no workspace.
 
       /** True when the client's own catalogue already lists this session id. */
       const knownInCatalogue = (sessionId) => {
@@ -602,10 +616,19 @@ window.__ModuleLoader__.load({
           }
         }
 
-        /** 'known' can open now, 'archived' needs unarchiving first, else foreign. */
+        /**
+         * 'archived' must be tested FIRST: the Host's `session/list` does not
+         * filter archived Sessions (only the GUI's grouping surfaces hide
+         * them), so an archived Session is almost always also "known". The old
+         * order returned 'known' for archived Sessions and rendered a plain
+         * 「打开会话」 button; opening it left the id in `archivedSessionIds`,
+         * and the very next Workspace frame ran the client's own
+         * `clearArchivedCurrent()`, which drops the main view again ~30s later.
+         * So: archived -> 'archived' (unarchive first), known -> 'known', else foreign.
+         */
         const classifySession = (sessionId) => {
-          if (isKnownSession(sessionId)) return 'known'
           if (isArchivedSession(sessionId)) return 'archived'
+          if (isKnownSession(sessionId)) return 'known'
           return 'foreign'
         }
 
@@ -645,7 +668,7 @@ window.__ModuleLoader__.load({
             }
             const sessionsService = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
             const refresh = sessionsService?.manager?.refreshList
-            const settle = () => openSession(sessionId, cwd)
+            const settle = () => openSession(sessionId, cwd, { afterUnarchive: true })
             try {
               if (typeof refresh === 'function') Promise.resolve(refresh.call(sessionsService.manager)).then(settle, settle)
               else setTimeout(settle, 500)
@@ -714,8 +737,22 @@ window.__ModuleLoader__.load({
           }
         }
 
-        /** Put one session into the main column (the same call the sidebar uses). */
-        const openSession = (sessionId, cwd) => {
+        /**
+         * Put one session into the main column (the same call the sidebar uses).
+         * `options.afterUnarchive` marks a retry whose unarchive already
+         * succeeded: the client model installs the new archive set only when the
+         * unarchive reply lands, so re-testing it here could bounce straight
+         * back into another unarchive (an unbounded loop).
+         */
+        const openSession = (sessionId, cwd, options = {}) => {
+          // Defence in depth: opening an archived Session appears to work, then
+          // the client's `clearArchivedCurrent()` drops it again on the next
+          // Workspace frame. Never open one without unarchiving first.
+          if (options.afterUnarchive !== true && isArchivedSession(sessionId)) {
+            reportDiag({ kind: 'open-session-archived-redirect', sessionId, cwd: cwd ?? null })
+            unarchiveAndOpen(sessionId, cwd)
+            return
+          }
           if (!isKnownSession(sessionId)) {
             reportDiag({ kind: 'open-session-unknown', sessionId, cwd: cwd ?? null })
             setNotice('这个会话不在本 GUI 的会话目录里：无头进程是另一个进程 / 另一个 profile 拉起的，DSH 客户端只肯打开自己目录里的会话（sessions.retain: unknown session）。这里只能只读预览。')
@@ -856,7 +893,7 @@ window.__ModuleLoader__.load({
           listBody = ordered.map((session) => {
             const id = typeof session.id === 'string' ? session.id : ''
             const isRunning = session.running === true
-            const title = typeof session.title === 'string' && session.title !== '' ? session.title : `${id.slice(0, 8)}…`
+            const title = nameOf(session)
             const detail = session.lastTool
               ? `最近动作：${session.lastTool}${session.lastText ? ` — ${String(session.lastText).slice(0, 80)}` : ''}`
               : session.lastText
@@ -926,7 +963,7 @@ window.__ModuleLoader__.load({
             React.createElement('aside', { style: styles.list }, listBody),
             React.createElement('section', { style: styles.preview },
               doc.status === 'idle' || selected === undefined ? null : React.createElement('div', { style: styles.docHead },
-                React.createElement('span', { style: styles.docPath }, selected.title ? `${selected.title} · ${selected.id}` : selected.id),
+                React.createElement('span', { style: styles.docPath }, `${nameOf(selected)} · ${selected.id}`),
                 React.createElement('span', { style: styles.docActions },
                   React.createElement('span', { style: styles.docMeta },
                     `${selected.running === true ? '运行中' : '未运行'} · ${clockOf(selected.createdAt)} · ${formatSize(selected.size)}`),
@@ -989,7 +1026,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = inject
     // Pure helpers kept reachable for the offline smoke test.
-    exports.__internals = { parseBlocks, renderMarkdown, clockOf, agoOf, formatSize }
+    exports.__internals = { parseBlocks, renderMarkdown, clockOf, agoOf, formatSize, nameOf }
 
     return module.exports
   },

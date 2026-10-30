@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-headless-sessions-panel",
-  "version": "1.0.0",
-  "description": "Sidebar headless-sessions panel for DSH: lists running/recent headless sessions and exports each as readable Markdown, with open-into-workspace actions.",
+  "version": "1.0.1",
+  "description": "侧栏「无头会话」入口：列出本机正在运行的无头 DSH 会话，并可导出/预览其转录",
   "type": "module",
   "main": "lib/host.mjs",
   "exports": {
