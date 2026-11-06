@@ -69,6 +69,7 @@ import {
   IgnoreReason,
 } from './threads.mjs'
 import { DeliveryMode, deliverToSession, sessionState, wakeWithMail } from './wake.mjs'
+import { WakePlacement, explainPlacement, normalizePlacement, readWorkspaceCatalog } from './placement.mjs'
 import { applySessionModel, chooseSelection, describeSelection, isSelection, readCatalog } from './model-choice.mjs'
 
 const ROUTE = '/smart-mail'
@@ -116,6 +117,14 @@ function normalizeConfig(config) {
     model: config?.model ?? 'default',
     wakePrompt: config?.wakePrompt ?? '处理这封新邮件并按需回复。',
     wakeCwd: config?.wakeCwd ?? process.cwd(),
+    /**
+     * Where a mail-triggered Session starts. Stored as `{mode, workspaceId?, cwd?}`
+     * so the choice survives a reinstall and never has to hardcode a path:
+     *   default | workspace | cwd | ungrouped  — see placement.mjs.
+     * A profile written before this option existed has only `wakeCwd`, which
+     * normalizePlacement maps onto the cwd mode.
+     */
+    wakeTarget: normalizePlacement(config?.wakeTarget, config?.wakeCwd),
     tagPrefix: typeof config?.tagPrefix === 'string' && config.tagPrefix.length > 0 ? config.tagPrefix : DEFAULT_TAG_PREFIX,
     // A reply inside a known thread replaces that session's running turn.
     interruptSameThread: config?.interruptSameThread !== false,
@@ -154,6 +163,7 @@ const CONFIG_FIELDS = [
   'model',
   'wakePrompt',
   'wakeCwd',
+  'wakeTarget',
   'tagPrefix',
   'interruptSameThread',
   'continueThreads',
@@ -190,6 +200,7 @@ function configDigest(cfg) {
     allowFromSample: cfg.allowFrom.slice(0, 3),
     model: cfg.model,
     wakeCwd: cfg.wakeCwd,
+    wakeTarget: cfg.wakeTarget,
     wakePromptChars: String(cfg.wakePrompt ?? '').length,
     tagPrefix: cfg.tagPrefix,
     interruptSameThread: cfg.interruptSameThread,
@@ -552,6 +563,7 @@ async function handleMail(ctx, account, mail, cfg) {
       ok: false,
       route,
       error: wake.error ?? 'session creation failed',
+      wakeTarget: wake.placement ?? cfg.wakeTarget?.mode ?? null,
       rebind,
     }, rotationOf(cfg))
     return { ok: false, route }
@@ -585,6 +597,7 @@ async function handleMail(ctx, account, mail, cfg) {
     stage: 'done',
     route,
     rebind,
+    wakeTarget: wake.target ?? null,
     ...modelInfo,
   })
   appendLog({
@@ -594,6 +607,14 @@ async function handleMail(ctx, account, mail, cfg) {
     sessionId: wake.sessionId,
     tag,
     rebind,
+    // Where the Session actually started, resolved against the live registry —
+    // so "the mail woke a session in the wrong place" is answerable from the log.
+    wakeTarget: wake.target ?? null,
+    wakeMode: wake.placement ?? null,
+    // The directory the Host really used, plus the `sessions/--…--` folder the
+    // file lands in — so "where is my session?" is answerable from one log line.
+    wakeDir: wake.directory ?? null,
+    wakeProjectDir: wake.projectDirectory ?? null,
     ...modelInfo,
   }, rotationOf(cfg))
   return { ok: true, sessionId: wake.sessionId, route }
@@ -909,6 +930,23 @@ const plugin = {
               })
               return
             }
+            if (route === '/workspaces' && req.method === 'GET') {
+              // Live registry read every time: the panel must never offer a
+              // Workspace that was removed, and must pick up a new one without a
+              // restart. An empty list is a valid answer (headless-only Host).
+              const catalog = readWorkspaceCatalog(ctx)
+              json(res, 200, {
+                ok: true,
+                defaultWorkspaceId: catalog.defaultWorkspaceId,
+                workspaces: catalog.workspaces,
+                configured: liveConfig.wakeTarget,
+                modes: Object.values(WakePlacement),
+                // "未分组" is a membership answer, not a directory — spell out
+                // BOTH so the panel can say where the file will really go.
+                explained: explainPlacement(liveConfig.wakeTarget, catalog),
+              })
+              return
+            }
             if (route === '/models' && req.method === 'GET') {
               // The same catalog the session page renders, so the panel offers
               // exactly the models a conversation could actually run.
@@ -983,6 +1021,20 @@ const plugin = {
                 ...(body.model !== undefined ? { model: String(body.model) } : {}),
                 ...(body.wakePrompt !== undefined ? { wakePrompt: String(body.wakePrompt) } : {}),
                 ...(body.wakeCwd !== undefined ? { wakeCwd: String(body.wakeCwd) } : {}),
+                ...(body.wakeTarget !== undefined
+                  ? {
+                    wakeTarget: (() => {
+                      // Accept a full placement object, or the shorthand mode
+                      // string the panel sends when only the mode changed.
+                      const raw = body.wakeTarget
+                      const normalized = normalizePlacement(
+                        typeof raw === 'string' ? { mode: raw } : raw,
+                        body.wakeCwd !== undefined ? String(body.wakeCwd) : liveConfig.wakeCwd,
+                      )
+                      return normalized
+                    })(),
+                  }
+                  : {}),
                 ...(body.tagPrefix !== undefined ? { tagPrefix: String(body.tagPrefix) } : {}),
                 ...(body.interruptSameThread !== undefined ? { interruptSameThread: Boolean(body.interruptSameThread) } : {}),
                 ...(body.continueThreads !== undefined ? { continueThreads: Boolean(body.continueThreads) } : {}),

@@ -98,6 +98,84 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Where a mail-triggered Session starts.
+     *
+     * The Workspace list comes from the Host's live registry (`/workspaces`), so
+     * the panel offers exactly the groups this installation actually has — no
+     * path is hardcoded here, which is what makes the same package work on any
+     * machine. `未分组` is a real choice, not the absence of one: a Host with no
+     * registered Workspace still has to place the Session somewhere.
+     *
+     * @param {object} props
+     * @param {{workspaces: object[], defaultWorkspaceId: string|null}|null} props.catalog
+     * @param {{mode: string, workspaceId?: string, cwd?: string}} props.value
+     * @param {(next: object) => void} props.onChange
+     */
+    function WakeTargetPicker({ catalog, value, onChange }) {
+      const mode = value?.mode ?? 'default'
+      const workspaces = catalog?.workspaces ?? []
+      const defaultName = workspaces.find((w) => w.id === catalog?.defaultWorkspaceId)?.title ?? workspaces[0]?.title
+      const selectedWorkspace = value?.workspaceId !== undefined && workspaces.some((w) => w.id === value.workspaceId)
+        ? value.workspaceId
+        : (workspaces[0]?.id ?? '')
+
+      const MODE_LABELS = [
+        ['default', defaultName === undefined ? '默认工作区（Host 未登记工作区）' : `默认工作区（${defaultName}）`],
+        ['workspace', '指定工作区'],
+        ['ungrouped', '未分组（不加入任何工作区）'],
+        ['cwd', '自定义目录（目录填在下方“唤醒工作目录”）'],
+      ]
+
+      // "未分组" is a membership answer, not a folder — say BOTH, so "where is
+      // my file" has an answer before the first wake happens.
+      const explained = catalog?.explained
+
+      return h('div', null,
+        h(Field, { label: '唤醒到' },
+          h('select', {
+            style: styles.input,
+            value: mode,
+            onChange: (e) => {
+              const next = e.target.value
+              if (next === 'workspace') onChange({ mode: next, workspaceId: selectedWorkspace || undefined })
+              else onChange({ mode: next })
+            },
+          }, MODE_LABELS.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+        mode === 'workspace'
+          ? h(Field, { label: '工作区' },
+            workspaces.length === 0
+              ? h('span', { style: styles.help }, '这台 Host 没有登记任何工作区；请在 DSH 侧栏新建一个，或改选其它模式。')
+              : h('select', {
+                style: styles.input,
+                value: selectedWorkspace,
+                onChange: (e) => onChange({ mode: 'workspace', workspaceId: e.target.value }),
+              }, workspaces.map((w) => h('option', { key: w.id, value: w.id }, `${w.title} — ${w.path}`))))
+          : null,
+        h('div', { style: styles.row },
+          h('div', { style: styles.label }),
+          h('span', { style: styles.help },
+            mode === 'default'
+              ? '跟随 DSH 的默认工作区身份（首次使用登记的那个）；该身份缺失时用登记顺序里的第一个。'
+              : mode === 'ungrouped'
+                ? '会话不加入任何工作区，在侧栏「未分组」下出现；文件仍按 cwd 归档到 DSH 的 sessions 目录（见下方落点）。'
+                : mode === 'cwd'
+                  ? '用下面「唤醒工作目录」里填的绝对路径，工作区成员关系不参与。'
+                  : '会话直接创建在所选工作区里，与会话页“新建会话”的位置一致。')),
+        // Concrete landing spot: group + directory + the sessions subfolder.
+        explained === undefined || explained === null
+          ? null
+          : h('div', { style: { ...styles.row, marginTop: -2 } },
+            h('div', { style: styles.label }, '实际落点'),
+            h('span', { style: styles.help },
+              `分组：${explained.group}`,
+              explained.directory === null || explained.directory === undefined ? null : h('br'),
+              explained.directory === null || explained.directory === undefined ? null : `目录：${explained.directory}`,
+              explained.projectDirectory === null || explained.projectDirectory === undefined ? null : h('br'),
+              explained.projectDirectory === null || explained.projectDirectory === undefined ? null : `会话文件：%DSH_HOME%\\sessions\\${explained.projectDirectory}\\`)),
+      )
+    }
+
+    /**
      * A number field that can actually be typed into.
      *
      * A plain controlled `<input type="number">` bound to a number cannot be
@@ -329,6 +407,7 @@ window.__ModuleLoader__.load({
       })
       const [threads, setThreads] = useState(null)
       const [catalog, setCatalog] = useState(null)
+      const [workspaceCatalog, setWorkspaceCatalog] = useState(null)
 
       const refresh = useCallback(async () => {
         try {
@@ -345,6 +424,7 @@ window.__ModuleLoader__.load({
               interruptSameThread: data.config.interruptSameThread !== false,
               autoUnarchive: data.config.autoUnarchive !== false,
               modelSelection: data.config.modelSelection ?? null,
+              wakeTarget: data.config.wakeTarget ?? { mode: 'default' },
               logMaxBytes: data.config.logMaxBytes ?? 2097152,
               logKeepDays: data.config.logKeepDays ?? 7,
               logKeepFiles: data.config.logKeepFiles ?? 20,
@@ -365,6 +445,14 @@ window.__ModuleLoader__.load({
           setCatalog(data.ok ? data : { ok: false, error: data.error ?? 'unavailable' })
         } catch (cause) {
           setCatalog({ ok: false, error: cause instanceof Error ? cause.message : String(cause) })
+        }
+        try {
+          // Live Workspace registry: an install that never registered one
+          // returns an empty list, which is a valid (and handled) answer.
+          const data = await api('/workspaces')
+          setWorkspaceCatalog(data.ok ? data : { ok: false, workspaces: [], error: data.error ?? 'unavailable' })
+        } catch (cause) {
+          setWorkspaceCatalog({ ok: false, workspaces: [], error: cause instanceof Error ? cause.message : String(cause) })
         }
       }, [])
 
@@ -544,10 +632,15 @@ window.__ModuleLoader__.load({
           h(Field, { label: '唤醒工作目录' },
             h('input', {
               style: styles.input, value: cfg.wakeCwd, fontFamily: 'ui-monospace, Consolas, monospace',
-              placeholder: '新无头会话的工作目录',
+              placeholder: '仅在“唤醒到 = 自定义目录”时使用',
               onChange: (e) => setCfg((c) => ({ ...c, wakeCwd: e.target.value })),
               onBlur: () => saveConfig({ wakeCwd: cfg.wakeCwd }),
             })),
+          h(WakeTargetPicker, {
+            catalog: workspaceCatalog,
+            value: cfg.wakeTarget ?? { mode: 'default' },
+            onChange: (next) => saveConfig({ wakeTarget: next }),
+          }),
           h('div', { style: styles.row },
             h('div', { style: styles.label }),
             h('button', { style: styles.button, onClick: pollNow }, '立即轮询一次'),

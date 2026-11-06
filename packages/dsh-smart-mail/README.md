@@ -1,6 +1,6 @@
 # dsh-smart-mail
 
-DSH 本地插件：**一站式邮件收发 + 白名单智能唤醒 + 同一邮件线程续接原会话**。（v0.2.0，2026-10-26）
+DSH 本地插件：**一站式邮件收发 + 白名单智能唤醒 + 同一邮件线程续接原会话**。（v0.4.0，2026-11-06）
 
 - 纯 Node 实现（`node:tls`），**不需要额外安装任何软件**（无 nodemailer/imapflow/Python）。
 - 账号密码使用各邮箱的**授权码**（不是登录密码）。
@@ -33,6 +33,51 @@ DSH 本地插件：**一站式邮件收发 + 白名单智能唤醒 + 同一邮�
 - `allowFrom` 白名单：精确地址 `user@x.com` 或域名后缀 `@x.com`；**为空 = 永不唤醒**。
 - 白名单发件人的**新线程**邮件 → 创建全新 DSH 会话并注入处理提示词（无头、无弹窗）。
 - 非白名单邮件只做**每轮一条**汇总记录，**绝不唤醒**。
+
+#### 3.1 唤醒会话落在哪个工作区（v0.4.0，2026-11-06）
+
+面板「唤醒到」对应配置里的 `wakeTarget`，四种模式：
+
+| `wakeTarget.mode` | 含义 | 传给 Host 的建会话请求 |
+| --- | --- | --- |
+| `default`（缺省） | 跟随 Host 的默认工作区（首次使用登记的那个）；该身份缺失时用登记顺序里的第一个 | `{ workspaceId }` |
+| `workspace` | 指定某个已登记工作区（配 `workspaceId`） | `{ workspaceId }` |
+| `ungrouped` | 刻意不加入任何工作区，会话出现在侧栏「未分组」 | `{}`（不传位置，由 Host 的默认目录决定） |
+| `cwd` | 某个绝对目录（配 `cwd`；旧的扁平 `wakeCwd` 等价于这一档） | `{ cwd }` |
+
+**「未分组」的文件到底在哪？** 这是个高频疑问，所以面板里直接给了三行答案（`/smart-mail/workspaces`
+的 `explained` 字段）：
+
+- **分组**：未分组（不属于任何工作区，不在任何 `workspace.json` 的 `sessionIds` 里）；
+- **目录**：Host 的 `defaultCwd`，即**宿主进程的启动目录**（DSH 全库没有 `process.chdir`）。
+  实测桌面宿主是 `<用户目录>\.dsh\profiles\desktop`，**不是家目录**；web/无头宿主则是各自的启动目录；
+- **会话文件**：`<DSH_HOME>\sessions\--<编码后的目录>--\session-<uuid>\session.v4.jsonl.zstd`。
+
+DSH 的会话是**按会话 cwd 分目录**存的，不是按工作区：`E:\冯诺依曼工作区` →
+`--E-~51AF~8BFA~4F9D~66FC~5DE5~4F5C~533A--`（非 ASCII 字符转 `~` + 4 位大写十六进制）。
+`sessionProjectDirectory()` 复现了这条命名规则，并有单测拿本机三个真实目录名钉住。
+
+每次唤醒的日志也带 `wakeDir`（实际目录）和 `wakeProjectDir`（sessions 下的子目录名），
+所以事后查「这封邮件的会话文件在哪」也是一条命令的事。
+
+设计上三条硬约束，都是为了这个包能直接发 npm、在别人机器上开箱可用：
+
+1. **工作区用 id 引用，不写死路径。** 面板的工作区列表来自 `/smart-mail/workspaces`，
+   每次实时读 Host 的 `workspaceRegistry.list()`：别人机器上的工作区 id、名字、数量都不同，
+   用 id 才天然跨机器；路径只出现在 `cwd` 这一档，且由用户自己填。
+2. **成员关系交给 Host 校验。** Host 在把会话挂进工作区前会校验
+   `realpath(header.cwd) === workspace.path`，所以「选工作区」走 `create({ workspaceId })`，
+   由 Host 自己完成校验和 attach；插件不自己猜路径。
+3. **找不到就报错，不静默换地方。** 指定的 `workspaceId` 在 Host 上已不存在时，
+   本次唤醒返回 `wake target unavailable: ...` 并写进日志的 `error`，
+   **不会**退回到某个别的目录——只有 `default` 一档允许回落（那正是它的语义）。
+
+每次成功唤醒的日志都带 `wakeMode`（模式）、`wakeTarget`（解析出的实际落点，
+如 `workspace:冯诺依曼工作区` / `default:default-workspace` / `cwd:E:/x` / `ungrouped`）、
+`wakeDir` 与 `wakeProjectDir`，所以「这封邮件到底把会话建到哪了、文件在哪」都能直接从日志回答。
+
+> ⚠️ 升级提示：0.3.x 只有扁平的 `wakeCwd`。升级后不写 `wakeTarget` 时，
+> `wakeCwd` 会被自动当成 `cwd` 模式，行为与旧版一致；想改成别的模式在面板里选一次即可。
 
 ### 4. 同一邮件线程续接原会话
 1. **发信时记录线程标识**：每封外发邮件都有独立 `Message-ID`，写入 `threads.json` 的
@@ -116,7 +161,7 @@ modelSelection:
 | `plugin-start` | 每次启动，1 条 | 版本、pid、配置**摘要**（allowFrom 数量/前 3 条、轮询间隔、提示词长度等），`configChanged` |
 | `config-change` | 仅当有效配置**实际变化**（首次运行也算） | `changedFields`、`before`、`after`（完整 config） |
 | `mail-seen` | 每轮轮询**最多 1 条**，且仅当本轮有被忽略的邮件 | `fresh`/`blocked`/`skipped`、`reasons`、`senders`（前 5）、`decisions`（每个发件人的 allowlisted 判定）、`sample`（前 3 封） |
-| `mail-wake` | 每封被处理的白名单邮件 1 条，成功/失败都写 | 完整邮件头（from/to/cc/subject/Message-ID/In-Reply-To/References 计数/uid）、`threadVia`、`tag`、`route`、`sessionId`、`mode`、`interrupted`、`cancelUsed`、`unarchivePath`；失败另带完整 `error` |
+| `mail-wake` | 每封被处理的白名单邮件 1 条，成功/失败都写 | 完整邮件头（from/to/cc/subject/Message-ID/In-Reply-To/References 计数/uid）、`threadVia`、`tag`、`route`、`sessionId`、`mode`、`interrupted`、`cancelUsed`、`unarchivePath`、`wakeMode`（放置模式）、`wakeTarget`（实际落点）、`wakeDir`（实际目录）、`wakeProjectDir`（sessions 子目录名）；失败另带完整 `error` |
 | `send` | 每次发信 | `messageId`、`tag`、`inReplyTo`、`sessionId`、成功/失败 |
 | `poll-error` | IMAP 轮询异常 | 账号 + 完整 error |
 | `log-rotate` | 每次切分 | 切分原因、归档文件名、旧文件大小、当前策略 |
@@ -133,6 +178,7 @@ modelSelection:
 
 设置 → 插件 → 「智能邮箱」：
 账号增删改 + IMAP 测试、白名单编辑、轮询间隔、唤醒提示词/工作目录、手动轮询、
+**「唤醒到」工作区选择器**（默认工作区 / 指定工作区 / 未分组 / 自定义目录，选项来自 Host 实时工作区列表）、
 **邮件线程续接开关**（续接同一会话 / 同线程打断 / 归档会话拉回）、
 **日志轮转参数与健康度**、活动日志、**线程→会话映射表**。
 

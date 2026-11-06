@@ -2,15 +2,21 @@
 
 Community plugins for [DeepSeek Harness (DSH)](https://deepseek.com).
 
-> **dsh-smart-mail: use 0.3.0 or newer.** The 0.2.0 tree had two defects that made it
+> **dsh-smart-mail: use 0.4.0 or newer.** The 0.2.0 tree had two defects that made it
 > nearly unusable — the background poller never fired (only manual polling worked),
 > and multipart mail (QQ and most clients) arrived with an empty body. Both are fixed
 > in 0.3.0, which also adds per-thread model selection and config persistence.
 > 0.2.0 was never published to npm.
+>
+> **0.4.0 adds a wake-placement choice**: a mail-triggered session can start in the
+> Host's default Workspace, in a Workspace you pick by name, in no group at all
+> (未分组), or in a plain directory. Workspaces are referenced **by the id the Host
+> assigns**, never by a hardcoded path, so the same package works on any machine and
+> the panel lists whatever Workspaces that installation actually has.
 
 | Package | What it does |
 |---|---|
-| [`packages/dsh-smart-mail`](packages/dsh-smart-mail) | Multi-account IMAP/SMTP send & read tools, whitelist-only headless wake on new mail, and **same-thread reply continuation**: a reply resumes the original DSH session, interrupting its running turn first, and restores the session when it was archived. Thread resolution follows References/In-Reply-To → `X-DSH-Session` → subject tag. Also ships a real MIME body reader, per-thread model selection, quiet rotated logging, and panel config that survives a restart. Zero runtime dependencies. |
+| [`packages/dsh-smart-mail`](packages/dsh-smart-mail) | Multi-account IMAP/SMTP send & read tools, whitelist-only headless wake on new mail, and **same-thread reply continuation**: a reply resumes the original DSH session, interrupting its running turn first, and restores the session when it was archived. Thread resolution follows References/In-Reply-To → `X-DSH-Session` → subject tag. Also ships a real MIME body reader, per-thread model selection, **configurable wake placement (Workspace / ungrouped / directory)**, quiet rotated logging, and panel config that survives a restart. Zero runtime dependencies. |
 | [`packages/dsh-plugin-headless-sessions-panel`](packages/dsh-plugin-headless-sessions-panel) | Sidebar panel that lists running/recent headless DSH sessions and exports each as readable Markdown, with open-into-workspace actions. The session scanner ships inside the package. |
 
 ## Mail as a conversation entry point

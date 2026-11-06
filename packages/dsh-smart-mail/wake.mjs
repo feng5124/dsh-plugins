@@ -34,6 +34,8 @@
 
 import { randomUUID } from 'node:crypto'
 
+import { describePlacement, explainPlacement, normalizePlacement, readWorkspaceCatalog, resolvePlacement, sessionProjectDirectory } from './placement.mjs'
+
 /** How a prompt should be admitted into a Session. */
 export const DeliveryMode = {
   /** Replace the active turn (a reply inside the same thread). */
@@ -236,10 +238,17 @@ export async function deliverToSession(ctx, { sessionId, text, mode = DeliveryMo
 
 /**
  * Wake DSH with one prompt in a brand-new Session.
+ *
+ * The Session starts in the Workspace the panel chose (see placement.mjs).
+ * A requested Workspace that no longer exists is reported, never silently
+ * replaced: the wake record then names the missing target, and the caller can
+ * retarget. Only the *default* placement falls back (to the first registered
+ * Workspace), because "wherever the Host's default is" is the whole point of it.
+ *
  * @param ctx Host Cordis context carrying sessionController.
  * @param mail {from, subject, preview, account, at}
- * @param cfg {wakePrompt, wakeCwd, model}
- * @returns {Promise<{ok: boolean, sessionId?: string, error?: string}>}
+ * @param cfg {wakePrompt, wakeTarget, wakeCwd, model}
+ * @returns {Promise<{ok: boolean, sessionId?: string, error?: string, target?: string, placement?: string}>}
  */
 export async function wakeWithMail(ctx, mail, cfg) {
   const sc = ctx.get('sessionController')
@@ -254,10 +263,35 @@ export async function wakeWithMail(ctx, mail, cfg) {
     '请处理这封邮件；如需回信，先确认收件人意图，再调用 send_email 工具发送。',
   ].join('\n')
   try {
-    const created = await sc.create({ cwd: cfg.wakeCwd })
+    const catalog = readWorkspaceCatalog(ctx)
+    const placement = normalizePlacement(cfg.wakeTarget, cfg.wakeCwd)
+    const resolved = resolvePlacement(placement, catalog)
+    if (!resolved.ok) {
+      return { ok: false, error: `wake target unavailable: ${resolved.reason}`, placement: describePlacement(placement, catalog) }
+    }
+    const created = await sc.create(resolved.request)
     const sessionId = created.sessionId
     await admit(sc, { sessionId, text, mode: 'queue' })
-    return { ok: true, sessionId }
+    // Read back where the Host actually put it, instead of restating what we
+    // asked for: `create()` may resolve the location differently (未分组 hands
+    // the choice to the Host).
+    const explained = explainPlacement(placement, catalog)
+    let directory = explained.directory
+    try {
+      const live = ctx.get('sessions')?.get?.(sessionId)
+      const cwd = live?.header?.cwd ?? live?.session?.header?.cwd
+      if (typeof cwd === 'string' && cwd !== '') directory = cwd
+    } catch {
+      // The header is a nicety; the resolved placement above is still correct.
+    }
+    return {
+      ok: true,
+      sessionId,
+      target: resolved.target,
+      placement: placement.mode,
+      directory,
+      ...(directory === null || directory === undefined ? {} : { projectDirectory: sessionProjectDirectory(directory) }),
+    }
   } catch (error) {
     return { ok: false, error: errorText(error) }
   }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-smart-mail",
-  "version": "0.3.0",
-  "description": "Smart mail for DSH: multi-account IMAP/SMTP send & read tools, whitelist-only wake, and same-thread reply continuation that resumes (and interrupts) the original DSH session, restoring archived sessions when needed.",
+  "version": "0.4.0",
+  "description": "Smart mail for DSH: multi-account IMAP/SMTP send & read tools, whitelist-only wake with a configurable wake Workspace (default / named / ungrouped / directory), and same-thread reply continuation that resumes (and interrupts) the original DSH session, restoring archived sessions when needed.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +13,7 @@
     "./store.mjs": "./store.mjs",
     "./threads.mjs": "./threads.mjs",
     "./model-choice.mjs": "./model-choice.mjs",
+    "./placement.mjs": "./placement.mjs",
     "./wake.mjs": "./wake.mjs",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
@@ -26,6 +27,7 @@
     "threads.mjs",
     "mime.mjs",
     "model-choice.mjs",
+    "placement.mjs",
     "wake.mjs",
     "client.js",
     "cordis.patch.yml",
