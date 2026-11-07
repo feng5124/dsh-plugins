@@ -26,8 +26,10 @@ import { fileURLToPath } from 'node:url'
 const ROUTE_PREFIX = '/headless-sessions'
 /** Plugin-owned state directory, also used for the load/request stamps below. */
 const STATE_DIR = path.join(homedir(), '.dsh', 'headless-sessions')
-/** Reuse a recent answer instead of re-spawning the scanner on every poll. */
-const STATUS_TTL_MS = 2000
+/** Reuse a recent answer instead of re-spawning the scanner on every poll.
+ * The client polls every 4s, so the TTL must exceed that — a shorter TTL makes
+ * the cache useless and turns each poll into a fresh ~1s full scan. */
+const STATUS_TTL_MS = 5000
 const DUMP_TTL_MS = 3000
 /** Keep one exported transcript bounded; the panel is a preview, not an archive. */
 const MAX_DUMP_BYTES = 400 * 1024
@@ -85,6 +87,10 @@ function scriptCandidates() {
   const here = path.dirname(fileURLToPath(import.meta.url))
   const candidates = [
     process.env.DSH_HEADLESS_FORENSICS,
+    // 本插件内置的扫描器（2026-11-07 起，带 mtime 预过滤）：与工作区取证脚本同源字节，
+    // 加了「先 stat 后按 mtime 决定是否整读」的预过滤。排在工作区脚本之前，
+    // 让面板走的扫描路径随插件版本一起升级，不再依赖工作区目录里的那份。
+    path.join(here, 'find-headless.mjs'),
     // <workspace>/dsh-local-bundles/dsh-plugin-headless-sessions-panel/lib -> <workspace>/dsh-session-forensics
     path.resolve(here, '..', '..', '..', 'dsh-session-forensics', 'find-headless.mjs'),
     path.join(homedir(), '.dsh', 'headless-sessions', 'find-headless.mjs'),
@@ -124,6 +130,8 @@ const plugin = {
     const scripts = scriptCandidates()
     const nodes = nodeCandidates()
     let statusCache = null
+    /** In-flight scans by cache key: concurrent polls share one scanner run. */
+    const inflight = new Map()
     const dumpCache = new Map()
     let lastRequestStamp = 0
 
@@ -131,7 +139,7 @@ const plugin = {
       loadedAt: Date.now(),
       loadedAtLocal: new Date().toLocaleString('sv-SE'),
       plugin: 'headless-sessions-panel',
-      revision: 'scanner-routes-v2',
+      revision: 'scanner-routes-v3',
       module: import.meta.url,
       hostPid: process.pid,
       hostNode: process.versions.node,
@@ -164,7 +172,13 @@ const plugin = {
       if (statusCache !== null && statusCache.key === key && now - statusCache.at < STATUS_TTL_MS) {
         return { ...statusCache.payload, cached: true }
       }
-      const args = all ? ['--json', '--all', '--limit', '50'] : ['--json']
+      // Concurrent requests share one scanner run instead of stacking child
+      // processes (the run takes ~1s, the client polls every 4s).
+      const pending = inflight.get(key)
+      if (pending !== undefined) return pending
+      const task = (async () => {
+      // all=1 → 全部历史（不再只取前 50）；配合 client 端的 limit 由面板控制。
+      const args = all ? ['--json', '--all', '--limit', '0'] : ['--json']
       const result = await scan(args)
       let payload
       if (!result.ok) {
@@ -194,7 +208,7 @@ const plugin = {
           payload = {
             ok: true,
             all: Boolean(all),
-            scope: all ? '按更新时间排列的前 50 个会话' : '正在运行的无头会话 + 最近 5 分钟内活动过的会话',
+            scope: all ? '全部历史会话（按更新时间排列）' : '正在运行的无头会话 + 最近 5 分钟内活动过的会话',
             script: result.script,
             generatedAt: Date.now(),
             sessions,
@@ -203,6 +217,13 @@ const plugin = {
       }
       statusCache = { key, at: now, payload }
       return { ...payload, cached: false }
+      })()
+      inflight.set(key, task)
+      try {
+        return await task
+      } finally {
+        inflight.delete(key)
+      }
     }
 
     const dump = async (id) => {
@@ -237,6 +258,30 @@ const plugin = {
       return { ...payload, cached: false }
     }
 
+    /**
+     * 历史查询：时间段 + 关键词（浅/深）。
+     *
+     * 结果不缓存：搜索是用户主动触发的一次性动作，参数组合多（关键词×时间段×深浅），
+     * 缓存收益低而键空间大。浅搜 ~0.3s、深搜 ~4s（234 个会话实测），可接受。
+     *
+     * @param {{ since?: string|null, until?: string|null, q?: string|null, deep?: boolean }} query
+     */
+    const search = async ({ since = null, until = null, q = null, deep = false }) => {
+      const args = ['--search-json']
+      if (typeof since === 'string' && since !== '') args.push('--since', since)
+      if (typeof until === 'string' && until !== '') args.push('--until', until)
+      if (typeof q === 'string' && q !== '') args.push('--search', q)
+      if (deep === true) args.push('--deep')
+      const result = await scan(args)
+      if (!result.ok) return { ok: false, error: result.error }
+      try {
+        const parsed = JSON.parse(result.stdout)
+        return { ...parsed, script: result.script }
+      } catch (cause) {
+        return { ok: false, error: `cannot parse scanner output: ${cause instanceof Error ? cause.message : String(cause)}` }
+      }
+    }
+
     ctx.effect(() => {
       const dispose = ctx.webServer.register({
         kind: 'prefix',
@@ -268,6 +313,16 @@ const plugin = {
                 return
               }
               const result = await dump(id.trim())
+              json(res, result.ok ? 200 : 502, result)
+              return
+            }
+            if (url.pathname === `${ROUTE_PREFIX}/search`) {
+              const since = url.searchParams.get('since')
+              const until = url.searchParams.get('until')
+              const q = url.searchParams.get('q')
+              const deep = url.searchParams.get('deep') === '1'
+              // 全空就是“列全部历史”，也允许（面板的时间段浏览用它）。
+              const result = await search({ since, until, q, deep })
               json(res, result.ok ? 200 : 502, result)
               return
             }

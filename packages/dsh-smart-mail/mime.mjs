@@ -22,22 +22,41 @@
  * @module dsh-smart-mail/mime
  */
 
-/** Decode quoted-printable (`=3D`, `=20`, soft line breaks). */
-export function decodeQuotedPrintable(text) {
-  return String(text)
-    // Soft breaks: `=\r\n` / `=\n` join the lines.
-    .replace(/=\r?\n/g, '')
-    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+/**
+ * Decode quoted-printable (`=3D`, `=20`, soft line breaks).
+ *
+ * 字节还原：QP 是**字节级**编码——`=E4=BD=A0` 是 UTF-8 的三个字节，不是三个
+ * latin1 字符。先按字节收进 latin1 字符串，再按部件声明的 charset 一次性
+ * 解回文本；直接 fromCharCode 会让所有非 ASCII 正文变 mojibake
+ * （`你好` → `ä½ å¥½`，2026-11-07 P1 实证）。charset 缺省 utf-8；
+ * 无 TextDecoder 支持的 charset 退回 utf-8。
+ */
+export function decodeQuotedPrintable(text, charset) {
+  const bytes = Buffer.from(
+    String(text)
+      // Soft breaks: `=\r\n` / `=\n` join the lines.
+      .replace(/=\r?\n/g, '')
+      .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+    'latin1',
+  )
+  const label = String(charset ?? 'utf-8').toLowerCase()
+  try {
+    return new TextDecoder(label).decode(bytes)
+  } catch {
+    return bytes.toString('utf8')
+  }
 }
 
 /** Decode base64, ignoring whitespace and stray non-alphabet characters. */
-export function decodeBase64(text) {
+export function decodeBase64(text, charset) {
   const clean = String(text).replace(/[^A-Za-z0-9+/=]/g, '')
   if (clean === '') return ''
+  const bytes = Buffer.from(clean, 'base64')
+  const label = String(charset ?? 'utf-8').toLowerCase()
   try {
-    return Buffer.from(clean, 'base64').toString('utf8')
+    return new TextDecoder(label).decode(bytes)
   } catch {
-    return ''
+    return bytes.toString('utf8')
   }
 }
 
@@ -75,8 +94,9 @@ export function splitPart(part) {
 /** Decode one part's body according to its own Content-Transfer-Encoding. */
 export function decodePart({ headers, body }) {
   const encoding = (headers.get('content-transfer-encoding') ?? '').toLowerCase().trim()
-  if (encoding === 'base64') return decodeBase64(body)
-  if (encoding === 'quoted-printable') return decodeQuotedPrintable(body)
+  const charset = /charset\s*=\s*"?([\w-]+)"?/i.exec(headers.get('content-type') ?? '')?.[1]
+  if (encoding === 'base64') return decodeBase64(body, charset)
+  if (encoding === 'quoted-printable') return decodeQuotedPrintable(body, charset)
   return body
 }
 
@@ -222,15 +242,25 @@ export function extractBodyPreview(bytes, limit = 300) {
 
   if ((declaredMultipart && boundary !== '') || inferredBoundary !== '') {
     const parts = splitMultipart(raw, boundary).map(splitPart)
-    const decoded = parts.map((part) => ({
-      type: (part.headers.get('content-type') ?? 'text/plain').toLowerCase(),
-      text: decodePart(part),
-    }))
-    const plain = decoded.find((part) => part.type.startsWith('text/plain') && part.text.trim() !== '')
-    const html = decoded.find((part) => part.type.startsWith('text/html') && part.text.trim() !== '')
+    // 嵌套 multipart（mixed 里套 alternative——Gmail/Outlook 带附件邮件的
+    // 标准结构，本插件 text+html+附件的自产结构同款）：首层切分选中的
+    // "部件"是容器本身，边界汤会污染唤醒 prompt。对 multipart/* 容器下钻
+    // 一层再选正文（复审 P2 实证）。
+    const flatten = (parts) => parts.flatMap((part) => {
+      const type = (part.headers.get('content-type') ?? 'text/plain').toLowerCase()
+      if (type.startsWith('multipart/')) {
+        const innerBoundary = boundaryOf(part.headers.get('content-type') ?? '')
+        return innerBoundary === '' ? [{ headers: part.headers, text: '' }] : flatten(splitMultipart(part.body, innerBoundary).map(splitPart))
+      }
+      return [{ headers: part.headers, text: decodePart(part) }]
+    })
+    const decoded = flatten(parts)
+    const plain = decoded.find((part) => (part.headers.get('content-type') ?? 'text/plain').toLowerCase().startsWith('text/plain') && part.text.trim() !== '')
+    const html = decoded.find((part) => (part.headers.get('content-type') ?? '').toLowerCase().startsWith('text/html') && part.text.trim() !== '')
     const chosen = plain ?? html ?? decoded.find((part) => part.text.trim() !== '')
     if (chosen === undefined) return ''
-    const text = chosen.type.startsWith('text/html') ? htmlToText(chosen.text) : chosen.text
+    const chosenType = (chosen.headers.get('content-type') ?? '').toLowerCase()
+    const text = chosenType.startsWith('text/html') ? htmlToText(chosen.text) : chosen.text
     return tidy(text, limit)
   }
 
@@ -240,4 +270,103 @@ export function extractBodyPreview(bytes, limit = 300) {
   const type = (headers.get('content-type') ?? '').toLowerCase()
   const text = type.startsWith('text/html') ? htmlToText(decoded) : decoded
   return tidy(text, limit)
+}
+
+/**
+ * Extract attachment metadata (and bytes) from a full raw MIME message.
+ *
+ * 与 extractBodyPreview 同一套解析器，但目标是**二进制安全**的附件：
+ * base64/QP 按字节解进 Buffer，binary/8bit 原样取。只在调用方明确要附件时
+ * 才走（全文 FETCH 体量大）；返回 `content` 为 Buffer，`size` 字节数。
+ * 嵌套 multipart 只走一层（与 extractBodyPreview 一致，报告/附件客户端
+ * 极少嵌套，遇到时附件取不到但正文预览不受影响）。
+ *
+ * @param {Buffer|string} raw full message body (BODY[TEXT] bytes)
+ * @returns {Array<{filename: string, contentType: string, size: number, content: Buffer}>}
+ */
+export function extractAttachments(raw) {
+  const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ''), 'utf8')
+  const bodyText = bytes.toString('utf8')
+  const headEnd = bodyText.search(/\r?\n\r?\n/)
+  const topHeaders = headEnd === -1 ? bodyText : bodyText.slice(0, headEnd)
+  const contentType = /content-type:\s*([^\r\n]+)/i.exec(topHeaders)?.[1] ?? ''
+  // IMAP 的 BODY[TEXT] 从顶层正文的第一个字节开始，**不含顶层 MIME 头**——
+  // multipart 声明看不到，和 extractBodyPreview 一样按正文形态推断边界。
+  const declaredMultipart = /^multipart\/mixed/i.test(contentType.trim())
+  const boundary = declaredMultipart ? boundaryOf(contentType) : inferBoundary(bodyText)
+  if (boundary === '') return []
+  const out = []
+  for (const part of splitMultipart(bodyText, boundary).map(splitPart)) {
+    const disposition = (part.headers.get('content-disposition') ?? '').toLowerCase()
+    const type = (part.headers.get('content-type') ?? '').toLowerCase()
+    // 附件判定：Content-Disposition: attachment 优先；其次有 name= 参数的
+    // 非 text/ 常规正文部分。inline 的附件（有些客户端这么发）也算。
+    const hasName = /name\s*=\s*("[^"]*"|[^\s;]+)/i.test(part.headers.get('content-type') ?? '')
+    const isAttachment = disposition.startsWith('attachment') || (hasName && !type.startsWith('text/'))
+    if (!isAttachment) continue
+    // 文件名提取：无引号分支的捕获在**组 2**（组 1 是 quoted 形式专属），只取
+    // 组 1 会让 `filename=report.csv` 全落 attachment.bin；RFC 2231 的
+    // filename*=charset'lang'%E9%99%84 需 percent-decode（复审 P2 实证）。
+    const extractName = (header, param) => {
+      const quoted = new RegExp(`${param}\\*?\\s*=\\s*"([^"]*)"`, 'i').exec(header)
+      if (quoted !== null) return quoted[1]
+      const ext = new RegExp(`${param}\\*\\s*=\\s*([^;\\s]+)`, 'i').exec(header)
+      if (ext !== null) return decodeRfc2231(ext[1])
+      const bare = new RegExp(`${param}\\s*=\\s*([^;\\s]+)`, 'i').exec(header)
+      if (bare !== null) return bare[1]
+      return undefined
+    }
+    const rawName = extractName(part.headers.get('content-disposition') ?? '', 'filename')
+      ?? extractName(part.headers.get('content-type') ?? '', 'name')
+    const filename = rawName === undefined ? 'attachment.bin' : decodeMimeWordIfNeeded(rawName.trim().replace(/^"|"$/g, ''))
+    const encoding = (part.headers.get('content-transfer-encoding') ?? '').toLowerCase().trim()
+    const body = part.body.replace(/\r?\n/g, '')
+    let content
+    if (encoding === 'base64') content = Buffer.from(body, 'base64')
+    else if (encoding === 'quoted-printable') content = Buffer.from(
+      body.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+      'latin1',
+    )
+    else content = Buffer.from(part.body, 'utf8')
+    out.push({
+      filename,
+      contentType: (part.headers.get('content-type') ?? '').split(';')[0].trim() || 'application/octet-stream',
+      size: content.length,
+      content,
+    })
+  }
+  return out
+}
+
+/**
+ * RFC 2231 扩展参数值：`UTF-8''%E5%AD%A3...`（charset'lang'percent-encoded）。
+ * 仅处理 percent 部分；charset 非 utf-8 时 best-effort utf-8 解。
+ */
+function decodeRfc2231(value) {
+  const m = /^([\w-]*)'[^']*'(.*)$/.exec(value)
+  if (m === null) return value
+  const [, charset, encoded] = m
+  try {
+    const bytes = Buffer.from(encoded.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))), 'latin1')
+    try { return new TextDecoder(charset === '' ? 'utf-8' : charset.toLowerCase()).decode(bytes) } catch { return bytes.toString('utf8') }
+  } catch {
+    return encoded
+  }
+}
+
+/** RFC 2047 encoded-word in an attachment filename, decoded best-effort. */
+function decodeMimeWordIfNeeded(name) {
+  if (!/=\?/.test(name)) return name
+  try {
+    // 避免循环依赖：imap.mjs 的 decodeMimeWord 与本模块互不导入，这里
+    // 复制最小实现（仅 B/Q base64/qp 的 UTF-8 情况，附件名足够）。
+    return name.replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (_, charset, enc, data) => {
+      try {
+        const bytes = enc.toLowerCase() === 'b'
+          ? Buffer.from(data, 'base64')
+          : Buffer.from(data.replace(/_/g, ' ').replace(/=([0-9a-fA-F]{2})/g, (_, hx) => String.fromCharCode(parseInt(hx, 16))), 'latin1')
+        try { return new TextDecoder(String(charset).toLowerCase()).decode(bytes) } catch { return bytes.toString('utf8') }
+      } catch { return data }
+    })
+  } catch { return name }
 }

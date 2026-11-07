@@ -100,7 +100,10 @@ export function chooseSelection({ catalog, thread, configured, deployment }) {
     return { selection: defaultSelection, source: 'default', fallback: `${source}: ${reason}` }
   }
 
-  return { selection: defaultSelection, source: 'default' }
+  // 没有 thread pin 也没有配置模型时返回 undefined：续接的会话保留自己当前的
+  // 模型（GUI 里给会话选的模型不被每次邮件续接覆盖回部署默认，README §6 的
+  // 承诺）。新建会话本来就不记录 model/selection，行为不变。
+  return { selection: undefined, source: 'default' }
 }
 
 /**

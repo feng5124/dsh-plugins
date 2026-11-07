@@ -87,7 +87,11 @@ export const PRESETS = {
   outlook: {
     label: 'Outlook / Microsoft 365',
     imap: { host: 'outlook.office365.com', port: 993, tls: true },
-    smtp: { host: 'smtp.office365.com', port: 587, tls: true },
+    // 587 是 STARTTLS 提交端口，本客户端只实现隐式 TLS（STARTTLS 升级会当场
+    // 报错说明）。微软官方提交端口实为 587+STARTTLS；465 隐式 TLS 在部分租户
+    // 可用。预设给 465（能用的形态），备注写明 587 需要本客户端不支持的能力。
+    smtp: { host: 'smtp.office365.com', port: 465, tls: true },
+    smtpNote: '若 465 被租户策略拒绝，需要 587+STARTTLS（本客户端暂不支持 STARTTLS 升级）',
   },
   custom: {
     label: '自定义 IMAP/SMTP',
@@ -110,8 +114,104 @@ function writeJson(file, value) {
   writeFileSync(file, JSON.stringify(value, null, 2), { encoding: 'utf8', mode: 0o600 })
 }
 
-/* ------------------------------------------------------------------ accounts */
+/* ---------------------------------------------------------- attachment index */
 
+const ATTACHMENTS_FILE = path.join(STATE_DIR, 'attachments.json')
+
+/**
+ * 附件下载索引（2026-11-07 删除机制）：`download_attachment` 每次落盘都记一条，
+ * 清扫器按它删除过期文件——没有索引，插件就无法知道"哪些文件是我下载的"，
+ * 也就不敢做任何清理（用户目录里可能有别人的文件）。
+ *
+ *   attachments[accountId][savedPath] = { uid, filename, size, savedAt }
+ *
+ * 只登记本插件写出的路径；`byPath` 反查用于防止重复记录覆盖旧行。
+ */
+export function loadAttachmentIndex() {
+  const file = ATTACHMENTS_FILE
+  if (!existsSync(file)) return { byPath: {}, version: 1 }
+  let value
+  try {
+    value = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    // 损坏索引不能静默清零回写——登记全丢 = 孤儿文件永不清扫 + 面板清单
+    // 凭空消失且用户无从察觉（复审 P3）。改名归档留证，从空索引重新开始。
+    try {
+      const backup = `${file}.corrupt-${Date.now()}`
+      renameSync(file, backup)
+      console.error(`[smart-mail] attachments.json 损坏，已归档为 ${path.basename(backup)}`)
+    } catch { /* 归档失败也只能重来 */ }
+    return { byPath: {}, version: 1 }
+  }
+  const index = value && typeof value === 'object' ? value : {}
+  index.byPath = index.byPath && typeof index.byPath === 'object' ? index.byPath : {}
+  index.version = 1
+  return index
+}
+
+export function recordAttachment(accountId, savedPath, meta) {
+  const index = loadAttachmentIndex()
+  index.byPath[savedPath] = {
+    account: accountId,
+    uid: meta?.uid ?? null,
+    filename: meta?.filename ?? path.basename(savedPath),
+    size: meta?.size ?? null,
+    savedAt: Date.now(),
+  }
+  writeJson(ATTACHMENTS_FILE, index)
+}
+
+export function forgetAttachment(savedPath) {
+  const index = loadAttachmentIndex()
+  delete index.byPath[savedPath]
+  writeJson(ATTACHMENTS_FILE, index)
+}
+
+/**
+ * 清扫过期附件：删除 `savedAt` 距今超过 `keepDays` 的已登记文件并从索引移除。
+ *
+ * 防御性约束（清扫器是会删用户文件的东西，必须多重护栏）：
+ *   - 只碰**索引里登记过**的绝对路径，索引外文件一个不碰；
+ *   - 删前 stat 校验路径仍指向普通文件（目录/符号链接/已消失都跳过）；
+ *   - `keepDays <= 0` = 永久保留（关掉自动清理）。
+ *
+ * @param {number} keepDays 保留天数；0 或负数 = 不清扫
+ * @returns {{removed: number, failed: number, kept: number}}
+ */
+export function sweepAttachments(keepDays) {
+  const days = Number(keepDays)
+  if (!Number.isFinite(days) || days <= 0) return { removed: 0, failed: 0, kept: 0 }
+  const cutoff = Date.now() - days * 86_400_000
+  const index = loadAttachmentIndex()
+  let removed = 0
+  let failed = 0
+  let kept = 0
+  for (const [file, meta] of Object.entries(index.byPath)) {
+    const savedAt = meta?.savedAt ?? 0
+    if (savedAt >= cutoff) { kept += 1; continue }
+    try {
+      // 索引可能带着旧机器/已删目录的路径：existsSync 不真再删。
+      if (existsSync(file)) {
+        const st = statSync(file)
+        if (st.isFile()) {
+          unlinkSync(file)
+          removed += 1
+        } else {
+          failed += 1
+          continue // 不是普通文件：留在索引里，不静默吞掉
+        }
+      }
+      delete index.byPath[file]
+    } catch {
+      failed += 1
+      continue // 删失败（占用/权限）：留下次再试
+    }
+  }
+  writeJson(ATTACHMENTS_FILE, index)
+  return { removed, failed, kept }
+}
+
+/* ------------------------------------------------------------------ accounts */
 export function listAccounts() {
   return readJson(ACCOUNTS_FILE, [])
 }

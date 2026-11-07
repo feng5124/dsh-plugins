@@ -1,16 +1,16 @@
 // dsh-smart-mail — browser half.
 //
 // Contributes the 「智能邮箱」 management page under Settings → Plugins
-// (settings.plugins.tab): accounts CRUD with provider presets, whitelist
-// (allowFrom) editing, poll interval, wake prompt/cwd, IMAP test, manual
-// poll, and the activity log. All data flows through the Host half's
-// same-origin routes under /smart-mail/*.
+// (settings.plugins.tab). 信息架构按使用频率重排（2026-11-07 UI 重整）：
+//   ① 账号 + 白名单（含测试/拦截记录）→ ② 轮询间隔 → ③ 模型 → ④ 唤醒目标
+//   → ⑤ 线程续接/附件/日志轮转等低频项（默认折叠，点开才展开）。
+// All data flows through the Host half's same-origin routes under /smart-mail/*.
 window.__ModuleLoader__.load({
   id: 'dsh-smart-mail',
   factory: (require) => {
     const React = require('react')
     const h = React.createElement
-    const { useState, useEffect, useCallback } = React
+    const { useState, useEffect, useCallback, useRef } = React
 
     const API = '/smart-mail'
     const TAB_ID = 'smart-mail'
@@ -81,6 +81,13 @@ window.__ModuleLoader__.load({
         border: `1px solid ${COLOR.border}`, background: COLOR.nested, color: 'inherit',
         font: '14px/1 inherit', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
       },
+      /** 可折叠区块的标题行：整行可点，右侧箭头随开合转向。 */
+      toggleRow: {
+        display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', userSelect: 'none',
+        margin: '0 0 10px', fontSize: 14, fontWeight: 600,
+      },
+      toggleArrow: { fontSize: 10, color: COLOR.muted, width: 12 },
+      toggleHint: { fontWeight: 400, fontSize: 11, color: COLOR.muted },
     }
 
     async function api(path, init) {
@@ -95,6 +102,35 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.row },
         h('div', { style: styles.label }, label),
         children)
+    }
+
+    /**
+     * 可折叠区块：低频高级设置用。折叠时只显示标题 + 一句提示。
+     *
+     * 用原生 `<button type="button">` 作标题行（而不是给 div 加 role=button）：
+     * 原生按钮自带 Tab 焦点、Enter/Space 激活与屏幕阅读器语义，不需要再补
+     * tabIndex 和键盘事件（2026-11-07 打回项 A4）。
+     */
+    function CollapsibleSection({ title, hint, defaultOpen = false, onOpen, children }) {
+      const [open, setOpen] = useState(defaultOpen)
+      const toggle = () => {
+        setOpen((previous) => {
+          const next = !previous
+          if (next && onOpen !== undefined) onOpen()
+          return next
+        })
+      }
+      return h('div', { style: styles.section },
+        h('button', {
+          type: 'button',
+          style: { ...styles.toggleRow, background: 'transparent', border: 0, padding: 0, width: '100%', textAlign: 'left', color: 'inherit', font: 'inherit' },
+          'aria-expanded': open,
+          onClick: toggle,
+        },
+          h('span', { style: styles.toggleArrow, 'aria-hidden': true }, open ? '▾' : '▸'),
+          title,
+          open ? null : h('span', { style: styles.toggleHint }, hint ?? '')),
+        open ? children : null)
     }
 
     /**
@@ -362,36 +398,137 @@ window.__ModuleLoader__.load({
         onChange(next)
       }
 
-      return h('div', { style: styles.row },
-        h('div', { style: styles.label }, '邮件会话模型'),
-        h('select', {
-          style: { ...styles.input, flex: '1 1 260px' },
-          value: currentKey,
-          disabled: catalog === null,
-          onChange: (e) => pickModel(e.target.value),
-        },
-          h('option', { value: '' },
-            catalog?.default === undefined || catalog?.default === null
-              ? '跟随默认（不指定模型）'
-              : `跟随默认（${catalog.default.provider}/${catalog.default.model}）`),
-          groups.length === 0
-            ? h('option', { value: '', disabled: true }, catalog === null ? '正在读取模型目录…' : '（没有可用模型）')
-            : groups.map((group) => h('optgroup', { key: group.id, label: group.name ?? group.id },
-              (group.models ?? []).map((model) => h('option', {
-                key: `${group.id}\u0000${model.id}`,
-                value: `${group.id}\u0000${model.id}`,
-              }, model.name ?? model.id))))),
-        effortChoices.length === 0 ? null : h('select', {
-          style: { ...styles.input, flex: '0 0 110px' },
-          value: value?.reasoningEffort ?? '',
-          onChange: (e) => pickEffort(e.target.value),
-        },
-          h('option', { value: '' }, '默认档位'),
-          effortChoices.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name ?? effort.id))),
-        h('span', { style: styles.help },
-          catalog?.ok === false
-            ? `模型目录不可用：${catalog.error}`
-            : '选中的模型不可用时，本次唤醒自动改用默认模型。'))
+      return h('div', null,
+        h(Field, { label: '邮件会话模型' },
+          h('select', {
+            style: { ...styles.input, flex: '1 1 260px' },
+            value: currentKey,
+            disabled: catalog === null,
+            onChange: (e) => pickModel(e.target.value),
+          },
+            h('option', { value: '' },
+              catalog?.default === undefined || catalog?.default === null
+                ? '跟随默认（不指定模型）'
+                : `跟随默认（${catalog.default.provider}/${catalog.default.model}）`),
+            groups.length === 0
+              ? h('option', { value: '', disabled: true }, catalog === null ? '正在读取模型目录…' : '（没有可用模型）')
+              : groups.map((group) => h('optgroup', { key: group.id, label: group.name ?? group.id },
+                (group.models ?? []).map((model) => h('option', {
+                  key: `${group.id}\u0000${model.id}`,
+                  value: `${group.id}\u0000${model.id}`,
+                }, model.name ?? model.id))))),
+          effortChoices.length === 0 ? null : h('select', {
+            style: { ...styles.input, flex: '0 0 110px' },
+            value: value?.reasoningEffort ?? '',
+            onChange: (e) => pickEffort(e.target.value),
+          },
+            h('option', { value: '' }, '默认档位'),
+            effortChoices.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name ?? effort.id)))),
+        h('div', { style: { ...styles.row, marginTop: -2 } },
+          h('div', { style: styles.label }),
+          h('span', { style: styles.help },
+            catalog?.ok === false
+              ? `模型目录不可用：${catalog.error}`
+              : '选中的模型不可用时，本次唤醒自动改用默认模型，不会漏回邮件。')))
+    }
+
+    /**
+     * 白名单测试 + 最近拦截记录。
+     * 数据源：POST /allowfrom-test（纯本地判定，不发邮件）与 GET /blocked
+     * （seen-uids 里 allowed=false 的最近条目）。两个接口都只读。
+     *
+     * 测试用的是**当前草稿**（allowText），不是已保存配置：用户改完名单还没
+     * 离开输入框就点测试，也应该得到“按我眼前这份名单会不会放行”的答案。
+     * 草稿只参与本次判定，后端不落盘（2026-11-07 打回项 A3）。
+     *
+     * @param {object} props
+     * @param {string} props.allowText 白名单文本框里的当前草稿
+     */
+    function WhitelistTester({ allowText }) {
+      const [probe, setProbe] = useState('')
+      const [probeResult, setProbeResult] = useState(null)
+      const [blocked, setBlocked] = useState(null)
+      const [busy, setBusy] = useState(false)
+
+      const runTest = async () => {
+        setProbeResult(null)
+        const address = probe.trim()
+        if (address === '') {
+          setProbeResult({ ok: false, error: '请先填写要测试的发件人地址' })
+          return
+        }
+        setBusy(true)
+        try {
+          const draft = String(allowText ?? '').split('\n').map((line) => line.trim()).filter((line) => line !== '')
+          const result = await api('/allowfrom-test', {
+            method: 'POST',
+            body: JSON.stringify({ address, allowFrom: draft }),
+          })
+          setProbeResult(result)
+        } catch (cause) {
+          setProbeResult({ ok: false, error: cause instanceof Error ? cause.message : String(cause) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const loadBlocked = useCallback(async () => {
+        try {
+          const data = await api('/blocked?limit=10')
+          setBlocked(data.ok ? data.blocked : [])
+        } catch {
+          setBlocked([])
+        }
+      }, [])
+
+      // 挂载时拉一次 + 每 30 秒静默刷新（不抢编辑焦点，纯只读列表）。
+      useEffect(() => {
+        void loadBlocked()
+        const timer = setInterval(() => { void loadBlocked() }, 30000)
+        return () => clearInterval(timer)
+      }, [loadBlocked])
+
+      return h('div', null,
+        // ---- 测试按钮：本地判定是否命中 allowFrom ----
+        h(Field, { label: '测试地址' },
+          h('div', { style: { ...styles.switchWrap, flexWrap: 'wrap', flex: '1 1 auto', minWidth: 0 } },
+            h('input', {
+              style: { ...styles.input, flex: '0 1 260px' },
+              value: probe,
+              placeholder: 'user@example.com',
+              onChange: (e) => setProbe(e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); void runTest() } },
+            }),
+            h('button', {
+              type: 'button',
+              style: styles.button,
+              disabled: busy,
+              onClick: () => { void runTest() },
+            }, busy ? '判定中…' : '测试是否放行'))),
+        probeResult === null ? null : h('div', { style: { ...styles.row, marginTop: -4 } },
+          h('div', { style: styles.label }),
+          h('span', {
+            style: { ...styles.help, color: probeResult.ok ? (probeResult.allowlisted ? COLOR.ok : COLOR.error) : COLOR.error },
+          },
+            probeResult.ok === false
+              ? `无法判定：${probeResult.error ?? '未知原因'}`
+              : probeResult.allowlisted
+                ? `✓ 会放行：${probeResult.address}${probeResult.matchedRule ? `（命中规则 ${probeResult.matchedRule}）` : ''}`
+                : `✗ 不会唤醒：${probeResult.address} 不在白名单内`)),
+        h('div', { style: { ...styles.row, marginTop: -2 } },
+          h('div', { style: styles.label }),
+          h('span', { style: styles.help }, '按上面文本框里的当前内容判定（草稿无需先保存），只做本地比对、不发任何邮件。')),
+        // ---- 拦截记录：最近被白名单拦下的邮件 ----
+        h(Field, { label: '拦截记录' },
+          h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+            blocked === null
+              ? h('span', { style: styles.help }, '读取中…')
+              : blocked.length === 0
+                ? h('span', { style: styles.help }, '暂无拦截记录：还没有非白名单发件人来过。')
+                : h('div', { style: { ...styles.log, maxHeight: 140 } },
+                  blocked.map((entry, i) => h('div', { key: `${entry.account}-${entry.uid}-${i}` },
+                    `${new Date(entry.at).toLocaleString('zh-CN')} · ${entry.from} · 非白名单拦截${entry.subject ? ` · 「${entry.subject}」` : ''}`))),
+            h('span', { style: styles.help }, '被白名单挡下的邮件不会唤醒会话；这里显示最近 10 条（完整记录见活动日志的 mail-seen 行）。'))))
     }
 
     function SmartMailPage() {
@@ -404,16 +541,37 @@ window.__ModuleLoader__.load({
         continueThreads: true, interruptSameThread: true, autoUnarchive: true,
         modelSelection: null,
         logMaxBytes: 2097152, logKeepDays: 7, logKeepFiles: 20,
+        attachmentDir: '', attachmentKeepDays: 7,
       })
       const [threads, setThreads] = useState(null)
       const [catalog, setCatalog] = useState(null)
       const [workspaceCatalog, setWorkspaceCatalog] = useState(null)
+      // 慢数据（模型目录 / 工作区 / 线程）不随 8 秒心跳重拉：
+      // - models / workspaces 只在首次挂载拉一次；
+      // - threads 首次拉一次，之后由「进阶设置」展开时再拉。
+      // 状态（/status）才是那个每 8 秒必须刷新的东西（2026-11-07 打回项 A5）。
+      const slowLoadedRef = useRef(false)
+      // 已存在的账号决定“添加邮箱”区默认展开还是折叠。
+      const accounts = status?.accounts ?? []
+      const [addOpen, setAddOpen] = useState(accounts.length === 0)
+      // 首次拿到账号列表时校正一次默认展开状态（无账号=展开，有账号=折叠）。
+      const addDefaultAppliedRef = useRef(false)
+      useEffect(() => {
+        if (addDefaultAppliedRef.current || status === null) return
+        addDefaultAppliedRef.current = true
+        setAddOpen(accounts.length === 0)
+      }, [status, accounts.length])
+      // 编辑中的文本域（wakePrompt/wakeCwd/allowFrom/attachmentDir）不被 8 秒
+      // 轮询覆盖：聚焦期间冻结刷新回写，blur 后恢复（number-field 的同类修复，
+      // 文本输入期间超过 8 秒会被服务端值冲掉）。
+      const editingRef = useRef(false)
 
-      const refresh = useCallback(async () => {
+      /** 只刷新值得每 8 秒刷的：状态（开关、摘要、日志、轮询间隔）。 */
+      const refreshStatus = useCallback(async () => {
         try {
           const data = await api('/status')
           setStatus(data)
-          if (data.ok) {
+          if (data.ok && !editingRef.current) {
             setAllowText((data.config.allowFrom ?? []).join('\n'))
             setCfg({
               enabled: data.config.enabled !== false,
@@ -428,17 +586,19 @@ window.__ModuleLoader__.load({
               logMaxBytes: data.config.logMaxBytes ?? 2097152,
               logKeepDays: data.config.logKeepDays ?? 7,
               logKeepFiles: data.config.logKeepFiles ?? 20,
+              attachmentDir: data.config.attachmentDir ?? '',
+              attachmentKeepDays: data.config.attachmentKeepDays ?? 7,
             })
           }
         } catch (cause) {
           setNotice({ ok: false, text: `面板连不上 Host 路由：${cause instanceof Error ? cause.message : String(cause)}` })
         }
-        try {
-          const data = await api('/threads')
-          if (data.ok) setThreads(data)
-        } catch {
-          setThreads(null)
-        }
+      }, [])
+
+      /** 慢数据：模型目录 + 工作区注册表，只需在页面生命周期里拉一次。 */
+      const loadSlow = useCallback(async () => {
+        if (slowLoadedRef.current) return
+        slowLoadedRef.current = true
         try {
           // The same catalog the session page renders.
           const data = await api('/models')
@@ -456,11 +616,22 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      useEffect(() => { void refresh() }, [refresh])
+      /** 线程映射：首次进入或展开「进阶设置」时拉取（不跟随 8 秒心跳）。 */
+      const loadThreads = useCallback(async () => {
+        try {
+          const data = await api('/threads')
+          if (data.ok) setThreads(data)
+        } catch {
+          setThreads(null)
+        }
+      }, [])
+
+      useEffect(() => { void refreshStatus(); void loadSlow() }, [refreshStatus, loadSlow])
       useEffect(() => {
-        const timer = setInterval(() => { void refresh() }, 8000)
+        // 心跳只刷状态：慢数据由上面的首次加载与展开事件负责（打回项 A5）。
+        const timer = setInterval(() => { void refreshStatus() }, 8000)
         return () => clearInterval(timer)
-      }, [refresh])
+      }, [refreshStatus])
 
       const setDraftField = (key, value) => setDraft((d) => {
         const next = { ...d, [key]: value }
@@ -489,7 +660,7 @@ window.__ModuleLoader__.load({
           ? { ok: true, text: `账号已保存：${result.account.address}` }
           : { ok: false, text: `保存失败：${result.error}` })
         if (result.ok) setDraft((d) => ({ ...d, label: '', address: '', authCode: '' }))
-        await refresh()
+        await refreshStatus()
       }
 
       const testAccount = async (id) => {
@@ -502,7 +673,7 @@ window.__ModuleLoader__.load({
 
       const removeOne = async (id) => {
         await api(`/account?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
-        await refresh()
+        await refreshStatus()
       }
 
       const saveConfig = async (patch) => {
@@ -521,7 +692,7 @@ window.__ModuleLoader__.load({
         } else if (result.changedFields !== undefined && result.changedFields.length > 0) {
           setNotice({ ok: true, text: '配置已保存（重启后仍生效）' })
         }
-        await refresh()
+        await refreshStatus()
       }
 
       /** Pin (or clear) the model one thread's session should use. */
@@ -538,14 +709,14 @@ window.__ModuleLoader__.load({
               : `线程 ${tag} 模型已设为 ${selection.provider}/${selection.model}`,
           }
           : { ok: false, text: `线程模型保存失败：${result.error}` })
-        await refresh()
+        await loadThreads()
       }
 
       const pollNow = async () => {
         setNotice({ ok: true, text: '手动轮询中…' })
         const result = await api('/poll-now', { method: 'POST' })
         setNotice({ ok: true, text: `轮询完成：${JSON.stringify(result.results?.map((r) => ({ account: r.account, fresh: r.fresh, woke: r.woke?.length ?? 0 })))}` })
-        await refresh()
+        await refreshStatus()
       }
 
       const presets = status?.presets ?? {}
@@ -553,56 +724,128 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.page },
         h('h1', { style: styles.title }, '智能邮箱 dsh-smart-mail'),
         h('div', { style: styles.subtitle },
-          '多账号收发 + 白名单唤醒：只有 allowFrom 内发件人的新邮件会唤醒 DSH 会话；同一邮件线程的回复会续接原会话（必要时先打断其当前轮次），已归档的会话会被自动拉回。'),
+          '白名单内的发件人来新邮件时唤醒 DSH 会话；回复同一邮件线程会续接原会话。'),
 
         notice === null ? null : h('div', {
           style: { ...styles.notice, ...(notice.ok ? styles.noticeOk : styles.noticeError) },
         }, notice.text),
 
-        // ---- accounts ------------------------------------------------
+        // ---- ⓪ 自动收信总览：页面最顶上的“现在到底在不在自动收信” ------
+        h('div', { style: styles.section },
+          h('h2', { style: styles.sectionTitle }, '自动收信'),
+          h('div', { style: styles.row },
+            h('div', { style: styles.switchWrap, flex: '1 1 auto', minWidth: 0 },
+              h('button', {
+                type: 'button',
+                style: cfg.enabled ? styles.buttonPrimary : styles.button,
+                role: 'switch',
+                'aria-checked': cfg.enabled,
+                onClick: () => saveConfig({ enabled: !cfg.enabled }),
+              }, cfg.enabled ? '● 已启用' : '○ 已停用'),
+              h('span', { style: styles.help }, cfg.enabled
+                ? `每 ${cfg.pollIntervalSec} 秒检查一次新邮件`
+                : '已停止检查新邮件（收发工具不受影响）')),
+            h('button', { type: 'button', style: styles.button, onClick: pollNow }, '立即检查新邮件')),
+          h('div', { style: styles.help },
+            `账号 ${accounts.length} 个 · 白名单 ${(status?.config?.allowFrom ?? []).length} 条 · 唤醒到「${cfg.wakeTarget?.mode === 'cwd' ? '自定义目录' : cfg.wakeTarget?.mode === 'ungrouped' ? '未分组' : cfg.wakeTarget?.mode === 'workspace' ? '指定工作区' : '默认工作区'}」`)),
+
+        // ---- ① 账号：已有账号时“添加邮箱”默认折叠 ------------------------
         h('div', { style: styles.section },
           h('h2', { style: styles.sectionTitle }, '邮箱账号'),
-          (status?.accounts ?? []).map((a) =>
-            h('div', { key: a.id, style: styles.accountRow },
-              h('div', { style: styles.accountMain },
-                h('div', { style: styles.accountAddress }, `${a.label} · ${a.address}`),
-                h('div', { style: styles.accountMeta },
-                  `${presets[a.preset]?.label ?? a.preset} · imap ${a.imap.host}:${a.imap.port} · smtp ${a.smtp.host}:${a.smtp.port} · 授权码 ${a.authCodeTail}`)),
-              h('span', { style: styles.badge(true) }, presets[a.preset]?.label ?? a.preset),
-              h('button', { style: styles.button, onClick: () => testAccount(a.id) }, '测试'),
-              h('button', { style: styles.button, onClick: () => removeOne(a.id) }, '删除'))),
-          h('div', { style: { height: 10 } }),
-          h(Field, { label: '预设' },
-            h('select', {
-              style: styles.input, value: draft.preset,
-              onChange: (e) => setDraftField('preset', e.target.value),
-            }, Object.entries(presets).map(([key, p]) => h('option', { key, value: key }, p.label)))),
-          h(Field, { label: '邮箱地址' },
-            h('input', { style: styles.input, value: draft.address, placeholder: 'you@example.com', onChange: (e) => setDraftField('address', e.target.value) })),
-          h(Field, { label: '备注名' },
-            h('input', { style: styles.input, value: draft.label, placeholder: '可选', onChange: (e) => setDraftField('label', e.target.value) })),
-          h(Field, { label: '授权码' },
-            h('input', { style: styles.input, type: 'password', value: draft.authCode, placeholder: 'IMAP/SMTP 授权码，不是登录密码', onChange: (e) => setDraftField('authCode', e.target.value) })),
-          draft.preset === 'custom' ? h(React.Fragment, null,
-            h(Field, { label: 'IMAP 服务器' },
-              h('input', { style: styles.input, value: draft.imapHost, placeholder: 'imap.example.com:993', onChange: (e) => setDraftField('imapHost', e.target.value) })),
-            h(Field, { label: 'SMTP 服务器' },
-              h('input', { style: styles.input, value: draft.smtpHost, placeholder: 'smtp.example.com:465', onChange: (e) => setDraftField('smtpHost', e.target.value) }))) : null,
-          h('div', { style: styles.row },
-            h('div', { style: styles.label }),
-            h('button', { style: styles.buttonPrimary, onClick: saveAccount }, '保存账号'),
-            h('span', { style: styles.help }, '预设账号的服务器已自动填好，自定义预设需手填 IMAP/SMTP。'))),
+          accounts.length === 0
+            ? h('div', { style: styles.help }, '还没有账号：选服务商预设，填邮箱地址和授权码保存即可。')
+            : h('div', null, accounts.map((a) =>
+              h('div', { key: a.id, style: styles.accountRow },
+                h('div', { style: styles.accountMain },
+                  h('div', { style: styles.accountAddress }, `${a.label} · ${a.address}`),
+                  h('div', { style: styles.accountMeta },
+                    `${presets[a.preset]?.label ?? a.preset} · imap ${a.imap.host}:${a.imap.port} · smtp ${a.smtp.host}:${a.smtp.port} · 授权码 ${a.authCodeTail}`)),
+                h('button', { type: 'button', style: styles.button, onClick: () => testAccount(a.id) }, '测试'),
+                h('button', { type: 'button', style: styles.button, onClick: () => removeOne(a.id) }, '删除')))),
+          // 有账号时默认折叠，少占首屏；没有账号时直接展开（否则用户找不到入口）。
+          h('button', {
+            type: 'button',
+            style: { ...styles.toggleRow, background: 'transparent', border: 0, padding: 0, width: '100%', textAlign: 'left', color: 'inherit', font: 'inherit' },
+            'aria-expanded': addOpen,
+            onClick: () => setAddOpen((open) => !open),
+          },
+            h('span', { style: styles.toggleArrow, 'aria-hidden': true }, addOpen ? '▾' : '▸'),
+            '添加邮箱'),
+          addOpen
+            ? h('div', { style: { marginTop: 8 } },
+              h(Field, { label: '服务商' },
+                h('select', {
+                  style: styles.input, value: draft.preset,
+                  onChange: (e) => setDraftField('preset', e.target.value),
+                }, Object.entries(presets).map(([key, p]) => h('option', { key, value: key }, p.label)))),
+              h(Field, { label: '邮箱地址' },
+                h('input', { style: styles.input, value: draft.address, placeholder: 'you@example.com', onChange: (e) => setDraftField('address', e.target.value) })),
+              h(Field, { label: '授权码' },
+                h('input', { style: styles.input, type: 'password', value: draft.authCode, placeholder: 'IMAP/SMTP 授权码，不是登录密码', onChange: (e) => setDraftField('authCode', e.target.value) })),
+              draft.preset === 'custom' ? h(React.Fragment, null,
+                h(Field, { label: 'IMAP 服务器' },
+                  h('input', { style: styles.input, value: draft.imapHost, placeholder: 'imap.example.com:993', onChange: (e) => setDraftField('imapHost', e.target.value) })),
+                h(Field, { label: 'SMTP 服务器' },
+                  h('input', { style: styles.input, value: draft.smtpHost, placeholder: 'smtp.example.com:465', onChange: (e) => setDraftField('smtpHost', e.target.value) }))) : null,
+              presets[draft.preset]?.smtpNote ? h('div', { style: styles.row },
+                h('div', { style: styles.label }),
+                h('span', { style: styles.help }, presets[draft.preset].smtpNote)) : null,
+              h(Field, { label: '备注名' },
+                h('input', { style: styles.input, value: draft.label, placeholder: '可选，默认用邮箱地址', onChange: (e) => setDraftField('label', e.target.value) })),
+              h('div', { style: styles.row },
+                h('div', { style: styles.label }),
+                h('button', { type: 'button', style: styles.buttonPrimary, onClick: saveAccount }, '保存账号')))
+            : null),
 
-        // ---- wake whitelist -------------------------------------------
+        // ---- ② 白名单：谁可以唤醒 DSH ----------------------------------
         h('div', { style: styles.section },
-          h('h2', { style: styles.sectionTitle }, '白名单唤醒（最高优先级）'),
-          h(Field, { label: '启用轮询' },
-            h('div', { style: styles.switchWrap },
-              h('button', {
-                style: cfg.enabled ? styles.buttonPrimary : styles.button,
-                role: 'switch', 'aria-checked': cfg.enabled,
-                onClick: () => saveConfig({ enabled: !cfg.enabled }),
-              }, cfg.enabled ? '已启用' : '已停用'))),
+          h('h2', { style: styles.sectionTitle }, '谁可以唤醒 DSH'),
+          h('div', { style: styles.help },
+            '只有名单里的发件人来新邮件，才会自动唤醒 DSH 会话。不在名单里的邮件仍可正常读取，只是不会自动唤醒。'),
+          h(Field, { label: '允许的发件人' },
+            h('textarea', {
+              style: { ...styles.input, minHeight: 72, fontFamily: 'ui-monospace, Consolas, monospace' },
+              value: allowText,
+              placeholder: 'boss@company.com\n@trusted-domain.com',
+              onFocus: () => { editingRef.current = true },
+              onChange: (e) => setAllowText(e.target.value),
+              onBlur: () => { editingRef.current = false; saveConfig({ allowFrom: allowText.split('\n').map((s) => s.trim()).filter(Boolean) }) },
+            })),
+          h('div', { style: { ...styles.row, marginTop: -2 } },
+            h('div', { style: styles.label }),
+            h('span', { style: styles.help }, '每行一条：完整地址 user@x.com，或域名后缀 @x.com。留空 = 永不自动唤醒。')),
+          h(WhitelistTester, { allowText })),
+
+        // ---- ③ 收到邮件后做什么（常用项）-------------------------------
+        h('div', { style: styles.section },
+          h('h2', { style: styles.sectionTitle }, '收到邮件后做什么'),
+          h(Field, { label: '唤醒提示词' },
+            h('input', {
+              style: styles.input, value: cfg.wakePrompt,
+              placeholder: '唤醒后新会话收到的任务说明',
+              onFocus: () => { editingRef.current = true },
+              onChange: (e) => setCfg((c) => ({ ...c, wakePrompt: e.target.value })),
+              onBlur: () => { editingRef.current = false; saveConfig({ wakePrompt: cfg.wakePrompt }) },
+            })),
+          h(WakeTargetPicker, {
+            catalog: workspaceCatalog,
+            value: cfg.wakeTarget ?? { mode: 'default' },
+            onChange: (next) => saveConfig({ wakeTarget: next }),
+          }),
+          cfg.wakeTarget?.mode === 'cwd' ? h(Field, { label: '唤醒工作目录' },
+            h('input', {
+              style: styles.input, value: cfg.wakeCwd, fontFamily: 'ui-monospace, Consolas, monospace',
+              placeholder: '绝对路径，例如 E:\\work\\inbox',
+              onFocus: () => { editingRef.current = true },
+              onChange: (e) => setCfg((c) => ({ ...c, wakeCwd: e.target.value })),
+              onBlur: () => { editingRef.current = false; saveConfig({ wakeCwd: cfg.wakeCwd }) },
+            })) : null),
+
+        // ---- ④ 高级唤醒设置（低频，默认折叠）---------------------------
+        h(CollapsibleSection, {
+          title: '高级唤醒设置',
+          hint: '轮询频率、模型、线程续接、归档恢复',
+        },
           h(NumberField, {
             label: '轮询间隔(秒)',
             value: cfg.pollIntervalSec,
@@ -611,57 +854,15 @@ window.__ModuleLoader__.load({
             unit: '秒，最小 30',
             onCommit: (next) => saveConfig({ pollIntervalSec: next }),
           }),
-          h(Field, { label: 'allowFrom' },
-            h('textarea', {
-              style: { ...styles.input, minHeight: 72, fontFamily: 'ui-monospace, Consolas, monospace' },
-              value: allowText,
-              placeholder: 'boss@company.com\n@trusted-domain.com',
-              onChange: (e) => setAllowText(e.target.value),
-              onBlur: () => saveConfig({ allowFrom: allowText.split('\n').map((s) => s.trim()).filter(Boolean) }),
-            })),
-          h('div', { style: { ...styles.row, marginTop: -2 } },
-            h('div', { style: styles.label }),
-            h('span', { style: styles.help }, '每行一条：精确地址 user@x.com 或域名后缀 @x.com。列表为空 = 永不唤醒。')),
-          h(Field, { label: '唤醒提示词' },
-            h('input', {
-              style: styles.input, value: cfg.wakePrompt,
-              placeholder: '唤醒后新会话收到的任务说明',
-              onChange: (e) => setCfg((c) => ({ ...c, wakePrompt: e.target.value })),
-              onBlur: () => saveConfig({ wakePrompt: cfg.wakePrompt }),
-            })),
-          h(Field, { label: '唤醒工作目录' },
-            h('input', {
-              style: styles.input, value: cfg.wakeCwd, fontFamily: 'ui-monospace, Consolas, monospace',
-              placeholder: '仅在“唤醒到 = 自定义目录”时使用',
-              onChange: (e) => setCfg((c) => ({ ...c, wakeCwd: e.target.value })),
-              onBlur: () => saveConfig({ wakeCwd: cfg.wakeCwd }),
-            })),
-          h(WakeTargetPicker, {
-            catalog: workspaceCatalog,
-            value: cfg.wakeTarget ?? { mode: 'default' },
-            onChange: (next) => saveConfig({ wakeTarget: next }),
-          }),
-          h('div', { style: styles.row },
-            h('div', { style: styles.label }),
-            h('button', { style: styles.button, onClick: pollNow }, '立即轮询一次'),
-            h('span', { style: styles.help }, '唤醒模型默认跟随 DSH 当前默认模型；可在下面「邮件会话模型」里指定。')),
-
           h(ModelPicker, {
             catalog,
             value: cfg.modelSelection,
             onChange: (next) => saveConfig({ modelSelection: next }),
           }),
-          h('div', { style: { ...styles.row, marginTop: -2 } },
-            h('div', { style: styles.label }),
-            h('span', { style: styles.help },
-              '与会话页面的模型选择一致（provider / model / 推理档位）。不选 = 跟随默认；选中的模型不可用时，本次唤醒自动回落默认，不会漏回邮件。'))),
-
-        // ---- thread continuation --------------------------------------
-        h('div', { style: styles.section },
-          h('h2', { style: styles.sectionTitle }, '邮件线程续接'),
           h(Field, { label: '续接同一会话' },
             h('div', { style: styles.switchWrap },
               h('button', {
+                type: 'button',
                 style: cfg.continueThreads ? styles.buttonPrimary : styles.button,
                 role: 'switch', 'aria-checked': cfg.continueThreads,
                 onClick: () => saveConfig({ continueThreads: !cfg.continueThreads }),
@@ -669,6 +870,7 @@ window.__ModuleLoader__.load({
           h(Field, { label: '同线程打断' },
             h('div', { style: styles.switchWrap },
               h('button', {
+                type: 'button',
                 style: cfg.interruptSameThread ? styles.buttonPrimary : styles.button,
                 role: 'switch', 'aria-checked': cfg.interruptSameThread,
                 onClick: () => saveConfig({ interruptSameThread: !cfg.interruptSameThread }),
@@ -676,6 +878,7 @@ window.__ModuleLoader__.load({
           h(Field, { label: '归档会话拉回' },
             h('div', { style: styles.switchWrap },
               h('button', {
+                type: 'button',
                 style: cfg.autoUnarchive ? styles.buttonPrimary : styles.button,
                 role: 'switch', 'aria-checked': cfg.autoUnarchive,
                 onClick: () => saveConfig({ autoUnarchive: !cfg.autoUnarchive }),
@@ -683,13 +886,33 @@ window.__ModuleLoader__.load({
           h('div', { style: { ...styles.row, marginTop: -2 } },
             h('div', { style: styles.label }),
             h('span', { style: styles.help },
-              '同线程回复续接原会话；若该会话正在运行，先打断当前轮次再注入。已归档的会话会被拉回后继续使用（不新建会话）。'))),
+              '同线程回复续接原会话；该会话正在运行时先打断当前轮次再注入；已归档的会话自动拉回继续用（不新建）。'))),
 
-        // ---- log rotation ---------------------------------------------
-        h('div', { style: styles.section },
-          h('h2', { style: styles.sectionTitle }, '日志轮转'),
+        // ---- ⑤ 进阶设置（附件 / 日志 / 诊断，默认折叠）------------------
+        h(CollapsibleSection, {
+          title: '进阶设置',
+          hint: '附件保存与清理、日志轮转',
+        },
+          h(Field, { label: '附件保存目录' },
+            h('input', {
+              style: { ...styles.input, fontFamily: 'ui-monospace, Consolas, monospace' },
+              value: cfg.attachmentDir ?? '',
+              placeholder: '留空 = DSH 主进程工作目录下的 mail-attachments/',
+              onFocus: () => { editingRef.current = true },
+              onChange: (e) => setCfg((c) => ({ ...c, attachmentDir: e.target.value })),
+              onBlur: () => { editingRef.current = false; saveConfig({ attachmentDir: cfg.attachmentDir }) },
+            })),
           h(NumberField, {
-            label: '单文件上限(KiB)',
+            label: '附件保留(天)',
+            value: cfg.attachmentKeepDays ?? 7,
+            min: 0,
+            step: 1,
+            width: '0 0 120px',
+            unit: '天，0 = 永久保留',
+            onCommit: (next) => saveConfig({ attachmentKeepDays: next }),
+          }),
+          h(NumberField, {
+            label: '日志上限(KiB)',
             value: Math.round(cfg.logMaxBytes / 1024),
             min: 64,
             step: 64,
@@ -698,7 +921,7 @@ window.__ModuleLoader__.load({
             onCommit: (next) => saveConfig({ logMaxBytes: next * 1024 }),
           }),
           h(NumberField, {
-            label: '保留天数',
+            label: '日志保留(天)',
             value: cfg.logKeepDays,
             min: 1,
             step: 1,
@@ -706,41 +929,36 @@ window.__ModuleLoader__.load({
             onCommit: (next) => saveConfig({ logKeepDays: next }),
           }),
           h(NumberField, {
-            label: '最多归档数',
+            label: '日志归档数',
             value: cfg.logKeepFiles,
             min: 1,
             step: 1,
             unit: '个',
             onCommit: (next) => saveConfig({ logKeepFiles: next }),
-          }),
-          h('div', { style: { ...styles.row, marginTop: -2 } },
-            h('div', { style: styles.label }),
-            h('span', { style: styles.help },
-              `当前策略：${status?.logHealth?.policy ?? '按大小或跨天切分，保留最近 7 天'}。切分发生在写入前，历史归档仍可在上面「活动日志」里看到。`))),
+          })),
 
-        // ---- log ------------------------------------------------------
-        h('div', { style: styles.section },
-          h('h2', { style: styles.sectionTitle }, '活动日志'),
+        // ---- ⑥ 运行诊断（只读，展开才拉线程数据）-----------------------
+        h(CollapsibleSection, {
+          title: '运行诊断',
+          hint: '活动日志、邮件线程映射',
+          onOpen: () => { void loadThreads() },
+        },
           h('div', { style: styles.help },
-            status?.logHealth?.policy ?? '按大小或跨天自动切分，保留最近 7 天。'),
-          h('div', { style: styles.help },
-            `当前文件 ${Math.round((status?.logHealth?.currentBytes ?? 0) / 1024)} KiB / 上限 ${Math.round((status?.logHealth?.maxBytes ?? 0) / 1024)} KiB · 归档 ${status?.logHealth?.archives ?? 0} 个`),
+            `日志 ${Math.round((status?.logHealth?.currentBytes ?? 0) / 1024)} KiB / 上限 ${Math.round((status?.logHealth?.maxBytes ?? 0) / 1024)} KiB · 归档 ${status?.logHealth?.archives ?? 0} 个`),
           h('div', { style: styles.log },
             (status?.log ?? []).length === 0
               ? '（暂无记录）'
-              : status.log.map(formatLogEntry).join('\n'))),
-
-        // ---- threads ---------------------------------------------------
-        h('div', { style: styles.section },
-          h('h2', { style: styles.sectionTitle }, '邮件线程 → 会话映射'),
-          h('div', { style: styles.help },
-            `共 ${threads?.count ?? 0} 个线程（显示最近 50 个），已登记我方 Message-ID ${threads?.outgoingCount ?? 0} 条。回复这些线程会续接对应会话。`),
-          (threads?.threads ?? []).length === 0
-            ? h('div', { style: styles.help }, '（还没有线程）')
-            : h('div', null, threads.threads.map((t) => renderThreadRow(t, {
-              groups: catalog?.groups ?? [],
-              onSave: (tag, selection) => saveThreadModel(tag, selection),
-            })))))
+              : status.log.map(formatLogEntry).join('\n')),
+          h('div', { style: { ...styles.help, marginTop: 12 } },
+            `共 ${threads?.count ?? 0} 个邮件线程（显示最近 50 个）。回复这些线程会续接对应会话；每行下拉可单独钉住该线程用的模型。`),
+          threads === null
+            ? h('div', { style: styles.help }, '展开即加载…')
+            : (threads.threads ?? []).length === 0
+              ? h('div', { style: styles.help }, '（还没有线程）')
+              : h('div', null, threads.threads.map((t) => renderThreadRow(t, {
+                groups: catalog?.groups ?? [],
+                onSave: (tag, selection) => saveThreadModel(tag, selection),
+              })))))
     }
 
     /** One thread row: identity, the session it maps to, and its model pin. */

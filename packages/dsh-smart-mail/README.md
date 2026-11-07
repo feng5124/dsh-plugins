@@ -53,8 +53,8 @@ DSH 本地插件：**一站式邮件收发 + 白名单智能唤醒 + 同一邮�
   实测桌面宿主是 `<用户目录>\.dsh\profiles\desktop`，**不是家目录**；web/无头宿主则是各自的启动目录；
 - **会话文件**：`<DSH_HOME>\sessions\--<编码后的目录>--\session-<uuid>\session.v4.jsonl.zstd`。
 
-DSH 的会话是**按会话 cwd 分目录**存的，不是按工作区：`E:\冯诺依曼工作区` →
-`--E-~51AF~8BFA~4F9D~66FC~5DE5~4F5C~533A--`（非 ASCII 字符转 `~` + 4 位大写十六进制）。
+DSH 的会话是**按会话 cwd 分目录**存的，不是按工作区：`D:\项目工作区` →
+`--D-~9879~76EE~5DE5~4F5C~533A--`（非 ASCII 字符转 `~` + 4 位大写十六进制）。
 `sessionProjectDirectory()` 复现了这条命名规则，并有单测拿本机三个真实目录名钉住。
 
 每次唤醒的日志也带 `wakeDir`（实际目录）和 `wakeProjectDir`（sessions 下的子目录名），
@@ -82,11 +82,15 @@ DSH 的会话是**按会话 cwd 分目录**存的，不是按工作区：`E:\冯
 ### 4. 同一邮件线程续接原会话
 1. **发信时记录线程标识**：每封外发邮件都有独立 `Message-ID`，写入 `threads.json` 的
    `outgoing[messageId] = tag`，并在主题前加 `[dsh-<tag>]`、加 `X-DSH-Session: <tag>`。
+   > ⚠ `inReplyTo` 会先经 `normalizeMessageId()` 归一化成 `<id@host>` 再上线：模型转述时可能把它写成
+   > HTML 实体（`&lt;…&gt;`）或夹带说明文字，原样写进 `In-Reply-To` 就是非法头、收件端只能当新会话
+   > （2026-11-07 真机实证，`ok:true` 但断链）。解不出 msg-id 时**直接报错**，不会静默降级。
 2. **收信时识别回复归属**（顺序即判定优先级，与 secondlgn/dsh-mail 一致）：
    1. `References` / `In-Reply-To` 命中我方 `Message-ID` → 取到 tag → 取到会话；
    2. `X-DSH-Session` 头（客户端若保留）；
    3. 主题里的 `[dsh-xxxx]` 标签（容错 `Re:`/`回复:`、大小写、丢右括号、编码重写）。
    只有命中**自己的线程表**才会续接，未知标签一律当作新线程。
+   > 主题解码遵循 RFC 2047 §6.2：相邻编码词之间的空白被丢弃（否则 QQ 折行后会解出 `已修 复`）。
 3. **续接前打断**：目标会话正在运行 → 先 `prompt(mode:'steer')`（当前轮次被替换）；
    若 Host 拒绝 steer，则 `prompt(mode:'queue')` 后立刻 `cancel({sessionId})`
    —— `cancel` 保留 inbox（`keepInbox: true`），所以刚排队的回复会**立即**被拾起，

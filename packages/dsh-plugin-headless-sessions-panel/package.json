@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-headless-sessions-panel",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "侧栏「无头会话」入口：列出本机正在运行的无头 DSH 会话，并可导出/预览其转录",
   "type": "module",
   "main": "lib/host.mjs",

@@ -285,14 +285,41 @@ export async function connect({ host, port, tls: secure = true }) {
   })
 }
 
-/** Decode MIME encoded-words (=??B?/=??Q?) in a header value. */
+/**
+ * Decode MIME encoded-words (=??B?/=??Q?) in a header value.
+ *
+ * 字节还原：B/Q 数据都是**字节级**编码（QP 的 =E4=BD=A0 是 UTF-8 三字节），
+ * 必须先收进 latin1 字符串再按声明 charset 解码；旧实现 UTF-8 Q 词用 utf8
+ * 直收（`你好` → `ä½ å¥½`）、B 词无视 charset（GBK 主题乱码），2026-11-07
+ * 实证修复。无 TextDecoder 支持的 charset 退回 utf-8。
+ */
 export function decodeMimeWord(input) {
   if (input == null) return null
-  return String(input).replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (_, charset, enc, data) => {
+  // RFC 2047 §6.2: whitespace between two adjacent encoded-words is not part
+  // of the text and must be ignored. Header unfolding inserts one space per
+  // folded line, so QQ/NetEase subjects split mid-sentence came out as
+  // `已修 复` (2026-11-07 真机唤醒实证). Drop that separator *before* decoding.
+  const joined = String(input).replace(
+    /(=\?[^?]+\?[bBqQ]\?[^?]*\?=)[ \t]+(?==\?[^?]+\?[bBqQ]\?[^?]*\?=)/g,
+    '$1',
+  )
+  return joined.replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (_, charset, enc, data) => {
     try {
-      if (enc.toLowerCase() === 'b') return Buffer.from(data, 'base64').toString('utf8')
-      const qp = data.replace(/_/g, ' ').replace(/=([0-9a-fA-F]{2})/g, (_, hx) => String.fromCharCode(parseInt(hx, 16)))
-      return Buffer.from(qp, /gb/i.test(charset) ? 'latin1' : 'utf8').toString('utf8')
+      const label = String(charset).toLowerCase()
+      let bytes
+      if (enc.toLowerCase() === 'b') {
+        bytes = Buffer.from(data, 'base64')
+      } else {
+        bytes = Buffer.from(
+          data.replace(/_/g, ' ').replace(/=([0-9a-fA-F]{2})/g, (_, hx) => String.fromCharCode(parseInt(hx, 16))),
+          'latin1',
+        )
+      }
+      try {
+        return new TextDecoder(label).decode(bytes)
+      } catch {
+        return bytes.toString('utf8')
+      }
     } catch {
       return data
     }
@@ -416,6 +443,37 @@ export async function fetchSummaries(session, uids) {
     if (parsed && parsed.uid != null) out.push(parsed)
   }
   return out
+}
+
+/**
+ * UID FETCH one message's FULL body (BODY.PEEK[TEXT], no partial limit) plus
+ * its headers. 附件取回用：全文可能几 MB，一次只取一封。
+ *
+ * @param {ImapSession} session
+ * @param {number} uid
+ * @returns {Promise<{uid: number, headerText: string, rawBody: Buffer}|null>}
+ */
+export async function fetchFullBody(session, uid) {
+  const lines = await session.exec(['UID', 'FETCH', String(uid), '(UID BODY.PEEK[HEADER] BODY.PEEK[TEXT])'])
+  for (const line of lines) {
+    if (!(line instanceof Line) || !/^\*\s+\d+\s+FETCH/i.test(line.text)) continue
+    const uidMatch = /UID\s+(\d+)/i.exec(line.text)
+    if (uidMatch === null || Number(uidMatch[1]) !== Number(uid)) continue
+    let headerText = ''
+    let rawBody = null
+    const marker = /\u0000LIT(\d+)\u0000/g
+    let match
+    while ((match = marker.exec(line.text)) !== null) {
+      const before = line.text.slice(0, match.index)
+      const bytes = line.literals[Number(match[1])]
+      if (bytes === undefined) continue
+      if (/BODY\[HEADER[^\]]*\]\s*$/i.test(before)) headerText = bytes.toString('utf8')
+      else if (/BODY\[TEXT\]\s*$/i.test(before)) rawBody = bytes
+    }
+    if (rawBody === null) return null
+    return { uid: Number(uidMatch[1]), headerText, rawBody }
+  }
+  return null
 }
 
 /**

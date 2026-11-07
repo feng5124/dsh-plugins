@@ -8,7 +8,8 @@
  *     wakes a fresh DSH session or **continues the session its mail thread is
  *     already bound to** (interrupting that session's running turn first);
  *   - same-origin HTTP routes under /smart-mail/* used by the settings panel
- *     (accounts CRUD, config, log, test, thread table, log health).
+ *     (accounts CRUD, config, log, test, thread table, log health, and the
+ *     read-only blocked feed).
  *
  * Thread continuation in one line: every message this plugin sends carries a
  * thread tag in the subject plus a recorded Message-ID; an inbound reply is
@@ -23,8 +24,8 @@
  * to debug a failure. See store.mjs for the rotation policy.
  */
 
-import { readFileSync } from 'node:fs'
-
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import {
   PRESETS,
   LOG_ROTATION,
@@ -51,9 +52,14 @@ import {
   loadLastConfig,
   saveLastConfig,
   matchesAllowFrom,
+  recordAttachment,
+  forgetAttachment,
+  sweepAttachments,
+  loadAttachmentIndex,
 } from './store.mjs'
 import { sendMail } from './smtp.mjs'
-import { openMailbox, selectInbox, searchSince, fetchSummaries, fetchThreaded, extractAddress, decodeMimeWord } from './imap.mjs'
+import { openMailbox, selectInbox, searchSince, fetchSummaries, fetchThreaded, fetchFullBody, extractAddress, decodeMimeWord } from './imap.mjs'
+import { extractAttachments } from './mime.mjs'
 import {
   THREAD_HEADER_FIELDS,
   DEFAULT_TAG_PREFIX,
@@ -62,6 +68,7 @@ import {
   messageIdsIn,
   newMessageId,
   newTag,
+  normalizeMessageId,
   tagFromSubject,
   tagSubject,
   detectLoop,
@@ -110,9 +117,13 @@ async function readBody(req) {
 
 /** Effective config from the profile patch plus defaults. */
 function normalizeConfig(config) {
+  // NaN 会穿过 Math.max 并把 setInterval 退化成 ~1ms 轮询轰炸（P2，2026-11-07）：
+  // 非有限数值一律回落默认。
+  const intervalRaw = Number(config?.pollIntervalSec ?? 120)
+  const pollIntervalSec = Number.isFinite(intervalRaw) ? Math.max(30, intervalRaw) : 120
   return {
     enabled: config?.enabled !== false,
-    pollIntervalSec: Math.max(30, Number(config?.pollIntervalSec ?? 120)),
+    pollIntervalSec,
     allowFrom: Array.isArray(config?.allowFrom) ? config.allowFrom.map(String) : [],
     model: config?.model ?? 'default',
     wakePrompt: config?.wakePrompt ?? '处理这封新邮件并按需回复。',
@@ -123,8 +134,18 @@ function normalizeConfig(config) {
      *   default | workspace | cwd | ungrouped  — see placement.mjs.
      * A profile written before this option existed has only `wakeCwd`, which
      * normalizePlacement maps onto the cwd mode.
+     *
+     * cwd 模式下面板改"唤醒工作目录"必须落进 wakeTarget.cwd：否则
+     * normalizePlacement 里 record.cwd（旧值）优先于 legacyCwd（新值），
+     * 改目录是静默无效操作（P1，2026-11-07 实证）。
      */
-    wakeTarget: normalizePlacement(config?.wakeTarget, config?.wakeCwd),
+    wakeTarget: (() => {
+      const placement = normalizePlacement(config?.wakeTarget, config?.wakeCwd)
+      if (placement.mode === 'cwd' && config?.wakeCwd !== undefined && config.wakeCwd !== '') {
+        return { ...placement, cwd: String(config.wakeCwd) }
+      }
+      return placement
+    })(),
     tagPrefix: typeof config?.tagPrefix === 'string' && config.tagPrefix.length > 0 ? config.tagPrefix : DEFAULT_TAG_PREFIX,
     // A reply inside a known thread replaces that session's running turn.
     interruptSameThread: config?.interruptSameThread !== false,
@@ -147,6 +168,35 @@ function normalizeConfig(config) {
     logMaxBytes: Math.max(64 * 1024, Number(config?.logMaxBytes ?? LOG_ROTATION.maxBytes)),
     logKeepDays: Math.max(1, Number(config?.logKeepDays ?? LOG_ROTATION.keepDays)),
     logKeepFiles: Math.max(1, Number(config?.logKeepFiles ?? LOG_ROTATION.keepFiles)),
+    /**
+     * 下载附件的保留天数（0 = 永久保留，不做自动清扫）。默认 7 天：
+     * 附件多为带敏感内容的文档，落盘即长期滞留不合适；要留久的用户显式调大或置 0。
+     */
+    attachmentKeepDays: (() => {
+      // 脏值防护：''/null/非数字一律回落 7 —— Number('')===0 会被语义化为
+      // "永久保留"，公开的 /config 路由发个空串就静默关闭自动清扫（复审 P3）。
+      const raw = config?.attachmentKeepDays
+      if (raw === undefined || raw === null || raw === '' || typeof raw === 'boolean') return 7
+      const num = Number(raw)
+      return Number.isFinite(num) ? Math.max(0, Math.min(365, num)) : 7
+    })(),
+    /**
+     * 下载附件的默认保存目录（空 = DSH 主进程工作目录下的 mail-attachments/，
+     * 面板文案已对齐）。download_attachment 的 dir 参数仍可逐次覆盖。
+     * 面板可改。改目录**不影响清扫**：索引按绝对路径记账，旧目录里已登记的
+     * 文件照常被清（测试钉住）。
+     */
+    attachmentDir: (() => {
+      if (typeof config?.attachmentDir !== 'string') return ''
+      const raw = config.attachmentDir.trim()
+      if (raw === '') return ''
+      // 守卫在 resolve **之前**：① 必须字面绝对路径；② 逐段禁 '..'（resolve
+      // 会把 .. 归一化掉，之后查 includes('..') 永远查不到——复审 P2 实证
+      // `'..\..\escape'` 被旧守卫放行）；③ 容忍 foo..bar 这类合法目录名。
+      if (!path.isAbsolute(raw)) return ''
+      if (raw.split(/[\\/]+/).some((seg) => seg === '..')) return ''
+      return path.resolve(raw)
+    })(),
   }
 }
 
@@ -172,6 +222,8 @@ const CONFIG_FIELDS = [
   'logMaxBytes',
   'logKeepDays',
   'logKeepFiles',
+  'attachmentKeepDays',
+  'attachmentDir',
 ]
 
 /** Which config fields differ between two effective configs. */
@@ -282,6 +334,30 @@ async function persistConfig(ctx, nextConfig) {
 
 /* ------------------------------------------------------------------ polling */
 
+/**
+ * 面板「测试按钮」用：与轮询完全同源的本地白名单判定（不发邮件、不联网）。
+ *
+ * @param {string} address 待测发件人地址
+ * @param {string[]} allowFrom 判定依据。调用方可以传**面板当前草稿**（未保存的
+ *   文本），这样「测试」和用户眼前看到的名单一致；草稿只参与本次判定，
+ *   本函数不写任何状态（打回项 A3）。
+ */
+function evaluateAllowFrom(address, allowFrom) {
+  const cleaned = String(address ?? '').trim()
+  if (cleaned === '') return { ok: false, error: '请输入要测试的邮箱地址' }
+  if (!/^[^\s@<>,;"]+@[^\s@<>,;"]+$/.test(cleaned)) {
+    return { ok: false, error: '这不是一个合法的邮箱地址（应为 user@example.com）' }
+  }
+  // 与 pollAccount 同口径：轮询取 From 头第一个地址作为路由身份，这里就是
+  // 单个地址本身；matchesAllowFrom = 精确地址或 @域名后缀（store.mjs）。
+  return { ok: true, address: cleaned, allowlisted: matchesAllowFrom(cleaned, allowFrom), matchedRule: (allowFrom ?? []).find((rule) => {
+    const r = String(rule).trim().toLowerCase()
+    if (!r) return false
+    const lower = cleaned.toLowerCase()
+    return r.startsWith('@') ? lower.endsWith(r) : lower === r
+  }) ?? null }
+}
+
 /** Sender summary for the batched mail-seen line: at most 5 entries. */
 function senderSummary(entries) {
   const counts = new Map()
@@ -317,13 +393,20 @@ async function pollAccount(ctx, account, cfg, log) {
     for (const mail of fetched) {
       if (seenMap[mail.uid] !== undefined) continue
       const headers = mail.headers
-      const from = addressesIn(headerValue(headers, 'from') ?? '')[0] ?? null
+      // 路由身份 = 第一个地址（angle-addr 优先）；多地址 From 的其余地址
+      // 仅作审计记录。白名单判定绝不"任一命中即放行"——那会让
+      // `attacker@evil.com, boss@trusted.example` 这类构造绕过白名单。
+      const fromAddresses = addressesIn(headerValue(headers, 'from') ?? '')
+      const from = fromAddresses[0] ?? null
       const subject = decodeMimeWord(headerValue(headers, 'subject') ?? '') ?? null
       const messageId = messageIdsIn(headerValue(headers, 'message-id') ?? '')[0] ?? null
       const inReplyTo = messageIdsIn(headerValue(headers, 'in-reply-to') ?? '')[0] ?? null
       const allowed = matchesAllowFrom(from, cfg.allowFrom)
       seenMap[mail.uid] = { at: Date.now(), from, subject, allowed, messageId }
-      fresh.push({ uid: mail.uid, headers, from, subject, messageId, inReplyTo, preview: mail.preview, allowed })
+      // 唤醒 prompt 里的「邮箱账号」必须来自账号配置，而不是这封邮件的头：
+      // 这里把账号地址钉进 fresh 记录，renderPrompt 才不会渲染出 undefined
+      //（2026-11-07 打回项 A6；fresh 记录原样传进 handleMail）。
+      fresh.push({ uid: mail.uid, headers, from, fromAddresses, subject, messageId, inReplyTo, preview: mail.preview, allowed, account: account.address })
     }
     seen[account.id] = seenMap
     saveSeen(seen)
@@ -509,7 +592,9 @@ async function handleMail(ctx, account, mail, cfg) {
     const modelInfo = await applyModelChoice(ctx, sessionId, loadThreads().byTag[tag], cfg)
     const result = await deliverToSession(ctx, {
       sessionId,
-      text: renderPrompt(mail, cfg, { isNew: false, round: round || 1, interrupted: false }),
+      // tag 是这条线程的身份：mail 对象本身不带它（它在 handleMail 里解析出来），
+      // 不显式传进去，prompt 的「线程标识」就会是 undefined（2026-11-07 真机验收抓到）。
+      text: renderPrompt({ ...mail, tag }, cfg, { isNew: false, round: round || 1, interrupted: false }),
       mode: cfg.interruptSameThread ? DeliveryMode.interrupt : DeliveryMode.queue,
     })
     if (result.ok) {
@@ -554,7 +639,7 @@ async function handleMail(ctx, account, mail, cfg) {
     subject: mail.subject,
     preview: mail.preview,
     at: Date.now(),
-  }, { ...cfg, wakePrompt: renderPrompt(mail, cfg, { isNew: true, round: 1 }) })
+  }, { ...cfg, wakePrompt: renderPrompt({ ...mail, tag }, cfg, { isNew: true, round: 1 }) })
 
   if (!wake.ok) {
     appendLog({
@@ -573,7 +658,14 @@ async function handleMail(ctx, account, mail, cfg) {
   // configured; apply it before the first prompt so the very first turn uses it.
   const modelInfo = await applyModelChoice(ctx, wake.sessionId, null, cfg)
 
-  const bound = bindThread(tag, { sessionId: wake.sessionId, subject: mail.subject })
+  const bound = bindThread(tag, {
+    sessionId: wake.sessionId,
+    subject: mail.subject,
+    // session-missing 的重绑是刻意的（上面的 state==='missing' 探测已确认旧
+    // 会话不存在）：不带 move 会被"tag 已占用"拒绝，线程永远指向死会话，
+    // 后续每封回复都新建孤儿会话（2026-11-07 P1 实证）。
+    move: rebind?.reason === 'session-missing',
+  })
   if (bound.rebound) {
     // Keep the established binding; the new session is left unreferenced and
     // the conflict is recorded instead of moving the thread.
@@ -711,6 +803,18 @@ const plugin = {
             subject: { type: 'string', description: 'Email subject.' },
             text: { type: 'string', description: 'Plain-text body.' },
             html: { type: 'string', description: 'Optional HTML body (sent as alternative part).' },
+            attachments: {
+              type: 'array',
+              description: 'Optional file attachments (max 10, total ≤ 20 MiB). Each item: { path } for a local file, or { filename, contentBase64 } for inline content.',
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'Absolute path of a local file to attach.' },
+                  filename: { type: 'string', description: 'Attachment name when passing contentBase64.' },
+                  contentBase64: { type: 'string', description: 'Base64 content when not attaching from a path.' },
+                },
+              },
+            },
             inReplyTo: { type: 'string', description: 'Message-ID being answered, e.g. <abc@x.com>. Keeps the reply in the same thread.' },
             threadTag: { type: 'string', description: 'Thread tag (e.g. a3f9). Defaults to the tag of the current session.' },
           },
@@ -725,14 +829,55 @@ const plugin = {
             return { ok: false, error: `account not found: ${args.account}`, accounts: picked.accounts.map((a) => ({ id: a.id, label: a.label, address: a.address })) }
           }
 
+          // Attachments: from disk (path) or inline (contentBase64). Bounded so
+          // one tool call cannot stream a whole directory into SMTP.
+          let attachments
+          if (Array.isArray(args.attachments) && args.attachments.length > 0) {
+            if (args.attachments.length > 10) return { ok: false, error: 'too many attachments (max 10)' }
+            attachments = []
+            let total = 0
+            for (const one of args.attachments) {
+              try {
+                if (typeof one?.path === 'string' && one.path !== '') {
+                  // stat 预检：先拒超大文件再整读——2GB 文件 readFileSync 会把
+                  // Host 内存打爆后才轮到总大小校验（复审 P3）。
+                  const st = statSync(one.path)
+                  if (!st.isFile()) return { ok: false, error: `attachment is not a regular file: ${one.path}` }
+                  if (st.size > 20 * 1024 * 1024) return { ok: false, error: `attachment too large: ${one.path} (${(st.size / 1048576).toFixed(1)} MiB, max 20 MiB total)` }
+                  total += st.size
+                  if (total > 20 * 1024 * 1024) return { ok: false, error: `attachments too large (${(total / 1048576).toFixed(1)} MiB, max 20 MiB total)` }
+                  const buffer = readFileSync(one.path)
+                  attachments.push({ filename: path.basename(one.path), content: buffer })
+                } else if (typeof one?.contentBase64 === 'string' && one.contentBase64 !== '') {
+                  const buffer = Buffer.from(one.contentBase64, 'base64')
+                  total += buffer.length
+                  attachments.push({ filename: one.filename ?? 'attachment.bin', content: buffer })
+                } else {
+                  return { ok: false, error: 'each attachment needs `path` or `filename`+`contentBase64`' }
+                }
+              } catch (error) {
+                return { ok: false, error: `attachment unreadable (${one.path ?? one.filename}): ${error instanceof Error ? error.message : String(error)}` }
+              }
+            }
+            if (total > 20 * 1024 * 1024) return { ok: false, error: `attachments too large (${(total / 1048576).toFixed(1)} MiB, max 20 MiB total)` }
+          }
+
           // Thread identity: explicit tag, else the tag of this very session,
           // else the tag our own outgoing table knows for the parent id.
+          // The parent id is normalized first: a tool argument carrying HTML
+          // entities (`&lt;…&gt;`) or surrounding prose must never reach the
+          // wire verbatim, or the reply silently starts a new thread
+          // (2026-11-07 真机验收实证).
           const sessionId = exec?.agent?.id
+          const parentId = normalizeMessageId(args.inReplyTo)
+          if (args.inReplyTo !== undefined && args.inReplyTo !== null && args.inReplyTo !== '' && parentId === undefined) {
+            return { ok: false, error: `inReplyTo is not a Message-ID: ${String(args.inReplyTo).slice(0, 120)} (expected <id@host>)` }
+          }
           const tag = args.threadTag
             ? String(args.threadTag).trim().toLowerCase().replace(/^\[?dsh-?/i, '').replace(/\]$/, '')
-            : (tagForSession(sessionId) ?? tagForOutgoing(args.inReplyTo) ?? undefined)
+            : (tagForSession(sessionId) ?? tagForOutgoing(parentId) ?? undefined)
           const messageId = newMessageId(account.address)
-          const references = messageIdsIn(args.inReplyTo)
+          const references = messageIdsIn(parentId)
           const subject = tag ? tagSubject(args.subject, tag, liveConfig.tagPrefix) : args.subject
 
           try {
@@ -742,8 +887,9 @@ const plugin = {
               subject,
               text: args.text,
               html: args.html,
+              attachments,
               messageId,
-              inReplyTo: args.inReplyTo,
+              inReplyTo: parentId,
               references,
               tag,
             })
@@ -757,10 +903,10 @@ const plugin = {
               ok: true,
               messageId,
               tag: tag ?? null,
-              inReplyTo: args.inReplyTo ?? null,
+              inReplyTo: parentId ?? null,
               sessionId: sessionId ?? null,
             })
-            return { ok: true, ...result, account: account.address, tag: tag ?? null, inReplyTo: args.inReplyTo ?? null }
+            return { ok: true, ...result, account: account.address, tag: tag ?? null, inReplyTo: parentId ?? null }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             log({ kind: 'send', account: account.id, to: args.to, subject, ok: false, error: message, tag: tag ?? null })
@@ -773,7 +919,8 @@ const plugin = {
         name: 'read_emails',
         description:
           'Read recent emails from a configured dsh-smart-mail account over IMAP (headers plus short body previews). ' +
-          'Returns newest first; use account id/label to pick a mailbox and daysBack/query to narrow.',
+          'Returns newest first; use account id/label to pick a mailbox and daysBack/query to narrow. ' +
+          'Messages that carry files list them in `attachments` (name + size only); use download_attachment to save one to disk.',
         parameters: {
           type: 'object',
           properties: {
@@ -802,14 +949,44 @@ const plugin = {
                 const seen = loadSeen()[account.id] ?? {}
                 uids = uids.filter((uid) => seen[uid] === undefined)
               }
-              const summaries = (await fetchSummaries(session, uids.slice(0, limit))).map((m) => ({
-                uid: m.uid,
-                from: m.fromAddress,
-                fromName: m.fromName,
-                subject: m.subject,
-                date: m.date,
-                preview: m.preview,
-              }))
+              // 附件元数据需要 multipart 结构，普通预览（BODY[TEXT]<0.2048>）
+              // 截断后看不到完整 boundary —— 对取回的摘要逐封补一次轻量
+              // 全文 FETCH。全文可能很大，只探前 5 封；其余列
+              // attachmentsUnprobed 让调用方知道可以单独再查。
+              const ATTACH_PROBE_LIMIT = 5
+              const picked0 = uids.slice(0, limit)
+              const summaries = []
+              for (const [i, m] of (await fetchSummaries(session, picked0)).entries()) {
+                const entry = {
+                  uid: m.uid,
+                  from: m.fromAddress,
+                  fromName: m.fromName,
+                  subject: m.subject,
+                  date: m.date,
+                  preview: m.preview,
+                  attachments: [],
+                }
+                if (i < ATTACH_PROBE_LIMIT) {
+                  try {
+                    const full = await fetchFullBody(session, m.uid)
+                    if (full !== null) {
+                      entry.attachments = extractAttachments(full.rawBody).map((a) => ({
+                        filename: a.filename, contentType: a.contentType, size: a.size,
+                      }))
+                    } else {
+                      // 探测不到正文 ≠ 没有附件：明确标注，模型不能拿 [] 转
+                      // 告用户"这封邮件没有附件"（复审 P1）。
+                      entry.attachmentsProbeFailed = true
+                    }
+                  } catch (error) {
+                    entry.attachmentsProbeFailed = true
+                    entry.attachmentsProbeError = error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)
+                  }
+                } else {
+                  entry.attachmentsUnprobed = true
+                }
+                summaries.push(entry)
+              }
               return { ok: true, account: account.address, count: summaries.length, emails: summaries }
             } finally {
               session.close()
@@ -819,6 +996,80 @@ const plugin = {
           }
         },
       }), 'smart-mail: read_emails tool')
+
+      ctx.effect(() => ctx.tools.register({
+        name: 'download_attachment',
+        description:
+          'Save one email attachment to a local directory (default: the DSH host working directory /mail-attachments/, or the panel-configured attachmentDir). ' +
+          'Pick the message by uid (from read_emails) and the attachment filename. Returns the absolute saved path; ' +
+          'file content is never inlined into the conversation. Existing files with the same name are never overwritten (a numbered suffix is added).',
+        parameters: {
+          type: 'object',
+          properties: {
+            uid: { type: 'number', description: 'The message uid from read_emails.' },
+            filename: { type: 'string', description: 'Exact attachment filename from read_emails.' },
+            dir: { type: 'string', description: 'Optional target directory (created if missing). Default: ./mail-attachments.' },
+            account: { type: 'string', description: 'Account id or label (optional when only one account is configured).' },
+          },
+          required: ['uid', 'filename'],
+        },
+        output: jsonOut(),
+        async execute(args) {
+          const picked = pickAccount(args.account)
+          if (picked.error) return { ok: false, error: picked.error }
+          const account = picked.account
+          if (!account) return { ok: false, error: `account not found: ${args.account}` }
+          if (!Number.isFinite(Number(args.uid))) return { ok: false, error: 'uid must be a number from read_emails' }
+          const wanted = String(args.filename ?? '')
+          if (wanted === '') return { ok: false, error: 'filename is required (exact name from read_emails)' }
+          // 落点防护：dir 必须是字面绝对路径且逐段无 '..'（resolve 会归一化
+          // 掉 ..，事后查 includes 永远查不到）；文件名剥路径分隔符。
+          // 默认 = 面板配置的 attachmentDir；没配 = DSH 主进程工作目录下的
+          // mail-attachments/（面板文案与工具描述同口径）。
+          const fallbackDir = (liveConfig.attachmentDir && liveConfig.attachmentDir !== '')
+            ? liveConfig.attachmentDir
+            : path.resolve(process.cwd(), 'mail-attachments')
+          const rawDir = args.dir !== undefined && String(args.dir).trim() !== '' ? String(args.dir).trim() : fallbackDir
+          if (!path.isAbsolute(rawDir) || rawDir.split(/[\\/]+/).some((seg) => seg === '..')) {
+            return { ok: false, error: `dir must be an absolute path without '..' segments: ${rawDir}` }
+          }
+          const dir = path.resolve(rawDir)
+          const safeName = path.basename(wanted).replace(/[\\/:*?"<>|]/g, '_') || 'attachment.bin'
+          try {
+            const session = await openMailbox(account)
+            try {
+              await selectInbox(session)
+              const full = await fetchFullBody(session, Number(args.uid))
+              if (full === null) return { ok: false, error: `message uid ${args.uid} not found (or has no body)` }
+              const parts = extractAttachments(full.rawBody)
+              const match = parts.find((a) => a.filename === wanted)
+              if (match === undefined) {
+                return { ok: false, error: `no attachment named "${wanted}" in uid ${args.uid}`, available: parts.map((a) => a.filename) }
+              }
+              mkdirSync(dir, { recursive: true })
+              // 同名不覆盖：用户手工放进保存目录的同名文件不能被静默替换
+              // （随后还会被清扫器按登记删除——复审 P3 指出的完整数据丢失链）。
+              let target = path.join(dir, safeName)
+              if (existsSync(target)) {
+                const ext = path.extname(safeName)
+                const stem = safeName.slice(0, safeName.length - ext.length)
+                for (let i = 1; existsSync(target) && i < 1000; i += 1) {
+                  target = path.join(dir, `${stem}(${i})${ext}`)
+                }
+              }
+              writeFileSync(target, match.content)
+              // 登记进索引：清扫器只删登记过的文件（见 store.sweepAttachments）。
+              recordAttachment(account.id, target, { uid: Number(args.uid), filename: path.basename(target), size: match.size })
+              log({ kind: 'attachment-saved', account: account.id, uid: Number(args.uid), filename: path.basename(target), bytes: match.size, dir, keepDays: liveConfig.attachmentKeepDays })
+              return { ok: true, path: target, filename: path.basename(target), size: match.size, contentType: match.contentType, keepDays: liveConfig.attachmentKeepDays, defaultDir: fallbackDir }
+            } finally {
+              session.close()
+            }
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) }
+          }
+        },
+      }), 'smart-mail: download_attachment tool')
     }
 
     /**
@@ -838,28 +1089,39 @@ const plugin = {
       let firstCheck = null
       let periodSec = 0
 
-      const tick = async () => {
-        if (disposed || busy) return
-        // A disabled poller keeps its timer but does no work, so re-enabling it
-        // from the panel takes effect on the next beat without a restart.
-        if (!liveConfig.enabled) return
+      /**
+       * One guarded poll round over every account. Shared by the timer tick and
+       * the manual `/poll-now` route — two concurrent rounds would both pass the
+       * Message-ID dedup (putMessage happens after the network round trip) and
+       * double-handle the same mail (P2, 2026-11-07).
+       */
+      const pollAllAccounts = async () => {
+        if (disposed || busy) return { ok: false, busy: true }
+        if (!liveConfig.enabled) return { ok: false, disabled: true }
         busy = true
         try {
+          const results = []
           for (const account of listAccounts()) {
             try {
-              await pollAccount(ctx, account, liveConfig, log)
+              results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig, log)) })
             } catch (error) {
               log({
                 kind: 'poll-error',
                 account: account.id,
                 error: error instanceof Error ? error.message : String(error),
               })
+              results.push({ account: account.id, ok: false, error: error instanceof Error ? error.message : String(error) })
             }
           }
+          return { ok: true, results }
         } finally {
           // Always release the guard: a throw above must not wedge the poller.
           busy = false
         }
+      }
+
+      const tick = async () => {
+        await pollAllAccounts()
       }
 
       /** (Re)create the interval for the current period. */
@@ -882,6 +1144,8 @@ const plugin = {
           log({ kind: 'poller-rearm', fromSec: periodSec, toSec: liveConfig.pollIntervalSec })
           schedule()
         },
+        /** One guarded poll round; shared with the timer tick (busy-checked). */
+        pollNow: pollAllAccounts,
         dispose() {
           disposed = true
           if (timer !== null) clearInterval(timer)
@@ -892,6 +1156,33 @@ const plugin = {
 
     /** Handle to the running poller, so the panel can re-arm it. */
     let poller = null
+
+    /**
+     * 附件清扫器（2026-11-07）：启动扫一次，之后每 6 小时一次。
+     * `keepDays=0` 时 sweepAttachments 直接 no-op，定时器空转无害。
+     * 失败只记日志——清扫器绝不能把宿主拖挂。
+     */
+    const startAttachmentSweeper = () => {
+      const sweep = (reason) => {
+        try {
+          const outcome = sweepAttachments(liveConfig.attachmentKeepDays)
+          if (outcome.removed > 0 || outcome.failed > 0) {
+            log({ kind: 'attachment-sweep', reason, ...outcome, keepDays: liveConfig.attachmentKeepDays })
+          }
+        } catch (error) {
+          log({ kind: 'attachment-sweep', reason, ok: false, error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+      sweep('boot')
+      const timer = setInterval(() => sweep('interval'), 6 * 3600_000)
+      timer.unref?.()
+      return {
+        sweepNow: (reason = 'manual') => sweep(reason),
+        dispose() { clearInterval(timer) },
+      }
+    }
+
+    let attachmentSweeper = null
 
     const applyRoutes = () => {
       ctx.effect(() => ctx.webServer.register({
@@ -1043,6 +1334,8 @@ const plugin = {
                 ...(body.logMaxBytes !== undefined ? { logMaxBytes: body.logMaxBytes } : {}),
                 ...(body.logKeepDays !== undefined ? { logKeepDays: body.logKeepDays } : {}),
                 ...(body.logKeepFiles !== undefined ? { logKeepFiles: body.logKeepFiles } : {}),
+                ...(body.attachmentKeepDays !== undefined ? { attachmentKeepDays: body.attachmentKeepDays } : {}),
+                ...(body.attachmentDir !== undefined ? { attachmentDir: String(body.attachmentDir) } : {}),
               })
               const changedNow = configDiff(before, liveConfig) ?? []
               // A rotation-policy change applies to the existing file at once,
@@ -1051,6 +1344,10 @@ const plugin = {
               if (rotationChanged) applyRotationNow('config-panel')
               // A new interval must take effect now, not at the next restart.
               if (changedNow.includes('pollIntervalSec')) poller?.rearm()
+              // 保留天数改小后立即扫一次（改大则无事发生，清扫器定时跑）。
+              // 改保存目录不触发清扫：索引按绝对路径记账，旧目录的已登记文件
+              // 照常被清，与当前目录无关（测试钉住）。
+              if (changedNow.includes('attachmentKeepDays')) attachmentSweeper?.sweepNow('config-change')
               if (changedNow.length > 0) {
                 log({
                   kind: 'config-change',
@@ -1082,15 +1379,91 @@ const plugin = {
               return
             }
             if (route === '/poll-now' && req.method === 'POST') {
-              const results = []
-              for (const account of listAccounts()) {
-                try {
-                  results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig, log)) })
-                } catch (error) {
-                  results.push({ account: account.id, ok: false, error: error instanceof Error ? error.message : String(error) })
+              // 走轮询器同一把 busy 锁：与定时 tick 并发时不再双重处理
+              //（去重在 putMessage 之前，并发轮询会双发唤醒）。
+              const outcome = poller !== null
+                ? await poller.pollNow()
+                : { ok: false, error: 'poller not started' }
+              if (outcome.ok) {
+                json(res, 200, { ok: true, results: outcome.results })
+              } else if (outcome.busy) {
+                json(res, 200, { ok: false, busy: true, error: 'a poll round is already in progress' })
+              } else {
+                json(res, 200, outcome)
+              }
+              return
+            }
+            if (route === '/allowfrom-test' && req.method === 'POST') {
+              // 白名单「测试按钮」：纯本地判定，绝不发邮件、不连任何服务器。
+              // body.allowFrom（字符串数组）= 面板当前草稿，仅参与本次判定、
+              // 不落盘；不传时按已保存配置判定（打回项 A3）。
+              const body = await readBody(req)
+              const draft = Array.isArray(body?.allowFrom)
+                ? body.allowFrom.map((rule) => String(rule).trim()).filter((rule) => rule !== '')
+                : undefined
+              const rules = draft === undefined ? liveConfig.allowFrom : draft
+              const result = evaluateAllowFrom(body?.address ?? body?.from, rules)
+              json(res, 200, { ...result, source: draft === undefined ? 'saved' : 'draft' })
+              return
+            }
+            if (route === '/blocked' && req.method === 'GET') {
+              // 只读：最近被拦下的邮件（mail-seen 聚合里的逐发件人判定）。
+              // seen-uids.json 已逐 uid 记录 {at, from, subject, allowed}（轮询
+              // 写入），这里筛 allowed===false 的条目跨账号新到旧排序，前端
+              // 展示"时间+发件人+原因"，不需要新落盘文件，也不改变收发行为。
+              // ⚠ 轮询器截断每账号 500 条，且面板样本默认 20 条——够展示，
+              // 不当审计源；权威审计仍是 activity.log.jsonl 的 mail-seen 行。
+              const seen = loadSeen()
+              const sample = Number(url.searchParams.get('limit') ?? 20)
+              const limit = Number.isFinite(sample) ? Math.max(1, Math.min(100, Math.trunc(sample))) : 20
+              const entries = []
+              for (const [accountId, uids] of Object.entries(seen)) {
+                for (const [uid, meta] of Object.entries(uids ?? {})) {
+                  if (meta?.allowed !== false) continue
+                  entries.push({
+                    at: meta.at ?? 0,
+                    from: meta.from ?? '(未知发件人)',
+                    subject: meta.subject ?? null,
+                    account: accountId,
+                    uid,
+                    reason: 'not-allowlisted',
+                  })
                 }
               }
-              json(res, 200, { ok: true, results })
+              entries.sort((a, b) => b.at - a.at)
+              json(res, 200, { ok: true, count: entries.length, blocked: entries.slice(0, limit) })
+              return
+            }
+            if (route === '/attachments' && req.method === 'GET') {
+              // 面板的"已下载附件"视图：索引内容 + 文件是否还在磁盘上。
+              const index = loadAttachmentIndex()
+              const now = Date.now()
+              const keepMs = liveConfig.attachmentKeepDays * 86_400_000
+              const entries = Object.entries(index.byPath).map(([file, meta]) => {
+                let onDisk = false
+                let size = meta?.size ?? null
+                try { const st = statSync(file); onDisk = st.isFile(); if (onDisk) size = st.size } catch { onDisk = false }
+                return {
+                  path: file,
+                  filename: meta?.filename ?? null,
+                  account: meta?.account ?? null,
+                  uid: meta?.uid ?? null,
+                  size,
+                  onDisk,
+                  savedAt: meta?.savedAt ?? 0,
+                  savedAtLocal: meta?.savedAt ? new Date(meta.savedAt).toLocaleString('sv-SE') : null,
+                  expiresAt: keepMs > 0 ? (meta?.savedAt ?? 0) + keepMs : null,
+                  expired: keepMs > 0 && (meta?.savedAt ?? 0) + keepMs < now,
+                }
+              }).sort((a, b) => b.savedAt - a.savedAt)
+              json(res, 200, { ok: true, keepDays: liveConfig.attachmentKeepDays, count: entries.length, attachments: entries })
+              return
+            }
+            if (route === '/attachments/sweep' && req.method === 'POST') {
+              if (attachmentSweeper === null) { json(res, 200, { ok: false, error: 'sweeper not started' }); return }
+              const outcome = sweepAttachments(liveConfig.attachmentKeepDays)
+              log({ kind: 'attachment-sweep', reason: 'panel', ...outcome, keepDays: liveConfig.attachmentKeepDays })
+              json(res, 200, { ok: true, keepDays: liveConfig.attachmentKeepDays, ...outcome })
               return
             }
             json(res, 404, { ok: false, error: `unknown route ${req.method} ${route}` })
@@ -1106,7 +1479,11 @@ const plugin = {
     // the return value as the cleanup.
     ctx.effect(() => {
       poller = startPoller()
-      return () => poller?.dispose()
+      attachmentSweeper = startAttachmentSweeper()
+      return () => {
+        poller?.dispose()
+        attachmentSweeper?.dispose()
+      }
     }, 'smart-mail: poller')
     applyRoutes()
   },

@@ -156,16 +156,76 @@ export function messageIdsIn(value) {
   return out
 }
 
-/** Every bare address in an address header value. */
+/**
+ * Canonical `<id@host>` from whatever a caller passed as the parent Message-ID.
+ *
+ * 真机教训（2026-11-07 22:33 验收线程）：Agent 从唤醒 prompt 里抄 Message-ID
+ * 时把它写成了 HTML 实体 `&lt;tencent_…&gt;`。旧实现原样塞进 `In-Reply-To`，
+ * 头部于是变成 `In-Reply-To: &lt;tencent_…&gt;`——**不是合法 msg-id**，收件端
+ * 只能当成新会话，于是"同线程回信"静默失效（本地 threads.json 却已按 tag 记了
+ * 一笔，看起来是成功的）。这里先解实体再取第一个 `<...>`；取不到就返回
+ * `undefined`，由调用方决定报错，绝不把脏值写进头部。
+ *
+ * @param {unknown} value
+ * @returns {string|undefined}
+ */
+export function normalizeMessageId(value) {
+  if (typeof value !== 'string') return undefined
+  const decoded = value
+    .replace(/&#0*6[02];/g, (m) => (m === '&#60;' ? '<' : '>'))
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, '&')
+  return messageIdsIn(decoded)[0]
+}
+
+/**
+ * Every bare address in an address header value.
+ *
+ * 安全语义：RFC 5322 的 `From: "显示名" <路由地址>` 中，引号内是**任意文本**
+ * （发件人随便写），只有 `<...>` 里的是真实路由地址。白名单判定若扫整行，
+ * `"boss@trusted.example" <attacker@evil.com>` 就会提取出显示名里的地址，
+ * 任何人把显示名设成白名单地址即可过闸（2026-11-07 P0 实证）。因此按逗号
+ * 分段处理：段内有 `<...>` 只认尖括号地址；否则剥掉引号显示名再扫裸地址
+ * （裸地址头与多地址头都保持兼容）。
+ *
+ * 分段必须**引号感知**：`"Doe, John" <john@x.com>` 的引号里就有逗号，
+ * 朴素 split 会把它切成脏段（2026-11-07 复审指出的变体）。调用方（白名单
+ * 判定）只应使用返回值的**第一个**地址作为发件身份——多地址 From 的其余
+ * 地址仅作审计，绝不参与放行判定。
+ */
 export function addressesIn(value) {
   if (value === undefined || value === null) return []
+  const segments = splitQuoted(String(value), ',')
   const out = []
-  const re = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
-  let match
-  while ((match = re.exec(String(value))) !== null) {
-    const address = match[0].toLowerCase()
-    if (!out.includes(address)) out.push(address)
+  const bare = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/
+  const angled = /<([^<>\s]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/
+  for (const segment of segments) {
+    const match = angled.exec(segment) ?? bare.exec(segment.replace(/"[^"]*"/g, ' '))
+    if (match !== null) {
+      const address = (match[1] ?? match[0]).toLowerCase()
+      if (!out.includes(address)) out.push(address)
+    }
   }
+  return out
+}
+
+/** Split on `sep`, ignoring separators inside double-quoted strings. */
+function splitQuoted(text, sep) {
+  const out = []
+  let current = ''
+  let inQuotes = false
+  for (const ch of text) {
+    if (ch === '"') inQuotes = !inQuotes
+    if (ch === sep && !inQuotes) {
+      out.push(current)
+      current = ''
+    } else {
+      current += ch
+    }
+  }
+  out.push(current)
   return out
 }
 

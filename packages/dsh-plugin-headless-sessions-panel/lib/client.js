@@ -26,8 +26,11 @@ window.__ModuleLoader__.load({
     const PANEL_TITLE = '无头会话'
     const STATUS_URL = '/headless-sessions/status'
     const DUMP_URL = '/headless-sessions/dump'
+    const SEARCH_URL = '/headless-sessions/search'
     /** Poll cadence for the session list, in milliseconds. */
     const POLL_MS = 4000
+    /** 列表一次渲染多少行（「加载更多」每次再加这么多）。 */
+    const PAGE_SIZE = 50
 
     const COLOR = {
       surface: 'var(--dsw-alias-bg-base)',
@@ -67,6 +70,20 @@ window.__ModuleLoader__.load({
         border: `1px solid ${COLOR.accent}`, background: COLOR.nested, font: 'inherit',
       },
       body: { flex: '1 1 auto', minHeight: 0, display: 'flex' },
+      /** 检索栏：关键词 + 两个日期 + 深搜开关 + 按钮，窄屏自动换行。 */
+      searchBar: {
+        flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+        padding: '10px 22px', borderBottom: `1px solid ${COLOR.border}`, background: COLOR.raised,
+      },
+      searchInput: {
+        boxSizing: 'border-box', minWidth: 0, padding: '6px 10px', borderRadius: 8,
+        border: `1px solid ${COLOR.border}`, background: COLOR.surface, color: 'inherit', font: 'inherit',
+      },
+      dateLabel: { display: 'inline-flex', alignItems: 'center', gap: 6, color: COLOR.muted, fontSize: 12 },
+      dateInput: {
+        padding: '5px 8px', borderRadius: 8, border: `1px solid ${COLOR.border}`,
+        background: COLOR.surface, color: 'inherit', font: 'inherit',
+      },
       list: {
         flex: '0 0 400px', maxWidth: '48%', minWidth: 0, overflowY: 'auto',
         borderRight: `1px solid ${COLOR.border}`, padding: '6px 0',
@@ -582,6 +599,60 @@ window.__ModuleLoader__.load({
         const panelAlive = React.useRef(true)
         React.useEffect(() => () => { panelAlive.current = false }, [])
 
+        // ---- 历史检索（2026-11-07 新增）----------------------------------
+        // query = 用户当前**已提交**的检索条件；q/since/until/deep 是输入框草稿。
+        const [query, setQuery] = React.useState({ q: '', since: '', until: '', deep: false })
+        const [q, setQ] = React.useState('')
+        const [since, setSince] = React.useState('')
+        const [until, setUntil] = React.useState('')
+        const [deep, setDeep] = React.useState(false)
+        const [search, setSearch] = React.useState({ phase: 'idle', data: null, error: null })
+        // 每次只渲染这么多行；「加载更多」每次 +PAGE_SIZE，避免一次性渲染几百行。
+        const [visibleCount, setVisibleCount] = React.useState(PAGE_SIZE)
+        const searchController = React.useRef(null)
+
+        const runSearch = React.useCallback(async (criteria) => {
+          if (searchController.current !== null) searchController.current.abort()
+          const controller = new AbortController()
+          searchController.current = controller
+          setSearch({ phase: 'loading', data: null, error: null })
+          const params = new URLSearchParams()
+          if (criteria.q !== '') params.set('q', criteria.q)
+          if (criteria.since !== '') params.set('since', criteria.since)
+          if (criteria.until !== '') params.set('until', criteria.until)
+          if (criteria.deep === true) params.set('deep', '1')
+          const result = await getJson(`${SEARCH_URL}?${params.toString()}`, controller.signal)
+          if (controller.signal.aborted) return
+          if (!result.ok) {
+            setSearch({ phase: 'error', data: null, error: result.error })
+            return
+          }
+          const value = result.value
+          if (value.ok === false) {
+            setSearch({ phase: 'error', data: null, error: String(value.error ?? '检索失败') })
+            return
+          }
+          setVisibleCount(PAGE_SIZE)
+          setSearch({ phase: 'ready', data: value, error: null })
+        }, [])
+
+        const searchActive = query.q !== '' || query.since !== '' || query.until !== ''
+        const submitSearch = () => {
+          const next = { q: q.trim(), since, until, deep }
+          setQuery(next)
+          setSelectedId(null)
+          setDoc({ status: 'idle', id: null, markdown: '', error: null, truncated: false })
+          runSearch(next)
+        }
+        const clearSearch = () => {
+          setQ('')
+          setSince('')
+          setUntil('')
+          setDeep(false)
+          setQuery({ q: '', since: '', until: '', deep: false })
+          setSearch({ phase: 'idle', data: null, error: null })
+        }
+
         /**
          * Is this session in the client's own catalogue? The client session
          * controller refuses `retain` for anything else ("unknown session"), and
@@ -800,12 +871,18 @@ window.__ModuleLoader__.load({
           const result = await getJson(`${DUMP_URL}?id=${encodeURIComponent(sessionId)}`, undefined)
           if (docToken.current !== token) return
           if (!result.ok) {
-            setDoc({ status: 'error', id: sessionId, markdown: '', error: result.error, truncated: false })
+            // 路由层失败也要说清楚“哪个 id 失败、失败原因是什么”，
+            // 否则面板只显示“导出失败”，排查只能去翻宿主日志。
+            setDoc({ status: 'error', id: sessionId, markdown: '', error: `导出 ${sessionId} 失败：${result.error}`, truncated: false })
             return
           }
           const value = result.value
           if (value.ok === false) {
-            setDoc({ status: 'error', id: sessionId, markdown: '', error: String(value.error ?? '导出失败'), truncated: false })
+            setDoc({
+              status: 'error', id: sessionId, markdown: '',
+              error: `导出 ${sessionId} 失败：${String(value.error ?? '宿主未给出原因')}`,
+              truncated: false,
+            })
             return
           }
           setDoc({
@@ -872,16 +949,74 @@ window.__ModuleLoader__.load({
         }, [list, ordered.length, showAll, loadDump])
 
         const subtitleParts = []
-        if (list.data === null) subtitleParts.push('正在读取无头会话…')
+        if (searchActive) {
+          const total = search.data === null ? 0 : (Array.isArray(search.data.results) ? search.data.results.length : 0)
+          subtitleParts.push(`检索「${query.q === '' ? '（仅时间段）' : query.q}」命中 ${total} 个`)
+          if (search.data?.since || search.data?.until) {
+            const fmt = (iso) => (typeof iso === 'string' ? iso.slice(0, 10) : '')
+            subtitleParts.push(`${fmt(search.data.since) || '最早'} ~ ${fmt(search.data.until) || '今天'}`)
+          }
+          subtitleParts.push(query.deep ? '范围：标题+正文' : '范围：标题/首句')
+          if (search.data?.rangeClamped === true) {
+            subtitleParts.push(`单次最多 ${search.data.maxSpanDays ?? 31} 天（已自动收窄）`)
+          }
+        } else if (list.data === null) subtitleParts.push('正在读取无头会话…')
         else {
           subtitleParts.push(`运行中的无头会话 ${running.length} 个`)
           if (others.length > 0) subtitleParts.push(`另有 ${others.length} 个最近活动/已结束`)
           subtitleParts.push(`更新于 ${clockOf(list.data.generatedAt)}`)
-          if (showAll) subtitleParts.push('范围：最近 50 个会话（按更新时间）')
+          if (showAll) subtitleParts.push(`范围：全部 ${ordered.length} 个会话（按更新时间）`)
         }
 
         let listBody
-        if (list.phase === 'error') {
+        if (searchActive) {
+          // ---- 检索结果视图 ------------------------------------------------
+          if (search.phase === 'loading') {
+            listBody = React.createElement('div', { style: styles.notice },
+              query.deep ? '正在检索全部会话正文（首次约几秒）…' : '正在检索…')
+          } else if (search.phase === 'error') {
+            listBody = React.createElement('div', { style: styles.noticeError }, `检索失败：${search.error}`)
+          } else if (search.data !== null) {
+            const rows = Array.isArray(search.data.results) ? search.data.results : []
+            if (rows.length === 0) {
+              listBody = React.createElement('div', { style: styles.notice },
+                '这个时间范围内没有匹配的会话。',
+                React.createElement('div', { style: { marginTop: 6, color: COLOR.muted } },
+                  query.deep ? '已搜索正文；换个关键词试试。' : '当前只搜标题/首句；勾选「连正文一起搜」可搜正文。'))
+            } else {
+              const shown = rows.slice(0, visibleCount)
+              listBody = React.createElement('div', null,
+                shown.map((session) => {
+                  const id = typeof session.id === 'string' ? session.id : ''
+                  return React.createElement('button', {
+                    key: id,
+                    type: 'button',
+                    style: styles.row(id === selectedId),
+                    title: id,
+                    onClick: () => loadDump(id),
+                  },
+                  React.createElement('span', { style: styles.rowTop },
+                    React.createElement('span', { style: styles.badge(session.running === true) },
+                      session.searchField === 'body' ? '正文命中' : '标题命中'),
+                    React.createElement('span', { style: styles.rowTitle }, nameOf(session))),
+                  React.createElement('span', { style: styles.rowMeta }, session.cwd ?? '?'),
+                  React.createElement('span', { style: styles.rowLine },
+                    `起于 ${session.createdAtLocal ?? clockOf(session.createdAt)} · 更新 ${agoOf(session.lastWrite)}`),
+                  session.snippet
+                    ? React.createElement('span', { style: { ...styles.rowLine, color: COLOR.text, whiteSpace: 'normal' } },
+                      `…${String(session.snippet).slice(0, 160)}…`)
+                    : null)
+                }),
+                shown.length < rows.length
+                  ? React.createElement('button', {
+                    type: 'button',
+                    style: { ...styles.button, margin: '10px 14px', width: 'calc(100% - 28px)' },
+                    onClick: () => setVisibleCount((count) => count + PAGE_SIZE),
+                  }, `加载更多（已显示 ${shown.length} / ${rows.length}）`)
+                  : null)
+            }
+          }
+        } else if (list.phase === 'error') {
           listBody = React.createElement('div', { style: styles.noticeError },
             `无法读取会话列表：${list.error}`,
             React.createElement('div', { style: { marginTop: 6, color: COLOR.muted } },
@@ -890,32 +1025,41 @@ window.__ModuleLoader__.load({
           listBody = React.createElement('div', { style: styles.notice },
             showAll ? '没有任何会话记录。' : '当前没有正在运行的无头会话，也没有最近 5 分钟内活动过的会话。')
         } else {
-          listBody = ordered.map((session) => {
-            const id = typeof session.id === 'string' ? session.id : ''
-            const isRunning = session.running === true
-            const title = nameOf(session)
-            const detail = session.lastTool
-              ? `最近动作：${session.lastTool}${session.lastText ? ` — ${String(session.lastText).slice(0, 80)}` : ''}`
-              : session.lastText
-                ? `最近内容：${String(session.lastText).slice(0, 110)}`
-                : session.goal
-                  ? `目标：${String(session.goal).slice(0, 110)}`
-                  : null
-            return React.createElement('button', {
-              key: id === '' ? `${session.cwd ?? 'session'}-${session.createdAt ?? ''}` : id,
-              type: 'button',
-              style: styles.row(id === selectedId),
-              title: id,
-              onClick: () => loadDump(id),
-            },
-            React.createElement('span', { style: styles.rowTop },
-              React.createElement('span', { style: styles.badge(isRunning) }, isRunning ? `运行中${session.pid ? ` pid=${session.pid}` : ''}` : '最近活动'),
-              React.createElement('span', { style: styles.rowTitle }, title)),
-            React.createElement('span', { style: styles.rowMeta }, session.cwd ?? '?'),
-            React.createElement('span', { style: styles.rowLine },
-              `起于 ${clockOf(session.createdAt)} · 更新 ${agoOf(session.lastWrite)}${isRunning ? '' : '（无运行中的无头进程）'}`),
-            detail === null ? null : React.createElement('span', { style: styles.rowLine }, detail))
-          })
+          const shown = ordered.slice(0, visibleCount)
+          listBody = React.createElement('div', null,
+            shown.map((session) => {
+              const id = typeof session.id === 'string' ? session.id : ''
+              const isRunning = session.running === true
+              const title = nameOf(session)
+              const detail = session.lastTool
+                ? `最近动作：${session.lastTool}${session.lastText ? ` — ${String(session.lastText).slice(0, 80)}` : ''}`
+                : session.lastText
+                  ? `最近内容：${String(session.lastText).slice(0, 110)}`
+                  : session.goal
+                    ? `目标：${String(session.goal).slice(0, 110)}`
+                    : null
+              return React.createElement('button', {
+                key: id === '' ? `${session.cwd ?? 'session'}-${session.createdAt ?? ''}` : id,
+                type: 'button',
+                style: styles.row(id === selectedId),
+                title: id,
+                onClick: () => loadDump(id),
+              },
+              React.createElement('span', { style: styles.rowTop },
+                React.createElement('span', { style: styles.badge(isRunning) }, isRunning ? `运行中${session.pid ? ` pid=${session.pid}` : ''}` : '最近活动'),
+                React.createElement('span', { style: styles.rowTitle }, title)),
+              React.createElement('span', { style: styles.rowMeta }, session.cwd ?? '?'),
+              React.createElement('span', { style: styles.rowLine },
+                `起于 ${clockOf(session.createdAt)} · 更新 ${agoOf(session.lastWrite)}${isRunning ? '' : '（无运行中的无头进程）'}`),
+              detail === null ? null : React.createElement('span', { style: styles.rowLine }, detail))
+            }),
+            shown.length < ordered.length
+              ? React.createElement('button', {
+                type: 'button',
+                style: { ...styles.button, margin: '10px 14px', width: 'calc(100% - 28px)' },
+                onClick: () => setVisibleCount((count) => count + PAGE_SIZE),
+              }, `加载更多（已显示 ${shown.length} / ${ordered.length}）`)
+              : null)
         }
 
         let previewBody
@@ -945,18 +1089,85 @@ window.__ModuleLoader__.load({
               React.createElement('button', {
                 type: 'button',
                 style: showAll ? styles.buttonActive : styles.button,
-                title: showAll ? '只看运行中/最近活动' : '列出最近 50 个会话',
+                title: showAll ? '只看运行中/最近活动' : '列出全部历史会话（可配合下方时间段与关键词）',
                 onClick: () => {
                   setShowAll((value) => !value)
                   setSelectedId(null)
+                  setVisibleCount(PAGE_SIZE)
                   setDoc({ status: 'idle', id: null, markdown: '', error: null, truncated: false })
                 },
               }, showAll ? '全部会话' : '仅运行中/近期'),
               React.createElement('button', {
                 type: 'button', style: styles.button,
-                onClick: () => setManualTick((value) => value + 1),
+                onClick: () => {
+                  if (searchActive) runSearch(query)
+                  setManualTick((value) => value + 1)
+                },
               }, '刷新'))),
-          list.phase === 'stale' && list.error !== null
+          // ---- 检索栏：时间段 + 关键词 + 深搜 ----------------------------
+          React.createElement('div', { style: styles.searchBar },
+            React.createElement('input', {
+              style: { ...styles.searchInput, flex: '1 1 220px' },
+              value: q,
+              placeholder: '搜索标题或会话内容（回车执行）',
+              'aria-label': '搜索会话',
+              onChange: (event) => setQ(event.target.value),
+              onKeyDown: (event) => { if (event.key === 'Enter') { event.preventDefault(); submitSearch() } },
+            }),
+            React.createElement('label', { style: styles.dateLabel },
+              '从', React.createElement('input', {
+                type: 'date',
+                style: styles.dateInput,
+                value: since,
+                'aria-label': '起始日期',
+                onChange: (event) => setSince(event.target.value),
+              })),
+            React.createElement('label', { style: styles.dateLabel },
+              '到', React.createElement('input', {
+                type: 'date',
+                style: styles.dateInput,
+                value: until,
+                'aria-label': '结束日期',
+                onChange: (event) => setUntil(event.target.value),
+              })),
+            React.createElement('label', {
+              style: { ...styles.dateLabel, cursor: 'pointer' },
+              title: '勾选后会解码全部会话正文来匹配关键词（约数秒），不勾只搜标题与首句',
+            },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: deep,
+                'aria-label': '连正文一起搜',
+                onChange: (event) => setDeep(event.target.checked),
+              }),
+              '连正文一起搜'),
+            React.createElement('button', { type: 'button', style: styles.buttonActive, onClick: submitSearch }, '搜索'),
+            searchActive
+              ? React.createElement('button', {
+                type: 'button', style: styles.button,
+                title: `跳到更早 ${search.data?.maxSpanDays ?? 31} 天`,
+                onClick: () => {
+                  const anchor = search.data?.since ?? search.data?.until
+                  if (typeof anchor !== 'string') return
+                  const base = new Date(anchor)
+                  if (Number.isNaN(base.getTime())) return
+                  const span = (search.data?.maxSpanDays ?? 31) * 86400000
+                  const nextUntil = new Date(base.getTime() - 1)
+                  const nextSince = new Date(nextUntil.getTime() - span)
+                  const pad = (n) => String(n).padStart(2, '0')
+                  const asDay = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                  const next = { q: q.trim(), since: asDay(nextSince), until: asDay(nextUntil), deep }
+                  setSince(next.since)
+                  setUntil(next.until)
+                  setQuery(next)
+                  runSearch(next)
+                },
+              }, '更早一段')
+              : null,
+            searchActive
+              ? React.createElement('button', { type: 'button', style: styles.button, onClick: clearSearch }, '清除')
+              : null),
+          list.phase === 'stale' && list.error !== null && !searchActive
             ? React.createElement('div', { style: styles.noticeError }, `上次刷新失败（显示缓存结果）：${list.error}`)
             : null,
           React.createElement('div', { style: styles.body },
