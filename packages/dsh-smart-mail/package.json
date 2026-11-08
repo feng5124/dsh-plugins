@@ -1,6 +1,6 @@
 {
   "name": "dsh-smart-mail",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Smart mail for DSH: multi-account IMAP/SMTP send & read tools (with attachments), whitelist-only wake with a configurable wake Workspace (default / named / ungrouped / directory), and same-thread reply continuation that resumes (and interrupts) the original DSH session, restoring archived sessions when needed.",
   "type": "module",
   "main": "index.js",
