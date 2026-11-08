@@ -951,12 +951,15 @@ window.__ModuleLoader__.load({
         const subtitleParts = []
         if (searchActive) {
           const total = search.data === null ? 0 : (Array.isArray(search.data.results) ? search.data.results.length : 0)
-          subtitleParts.push(`检索「${query.q === '' ? '（仅时间段）' : query.q}」命中 ${total} 个`)
+          // 没填关键词 = 遍历时间段内的全部会话；填了 = 关键词筛选。
+          subtitleParts.push(query.q === ''
+            ? `该时段全部会话 ${total} 个`
+            : `检索「${query.q}」命中 ${total} 个`)
           if (search.data?.since || search.data?.until) {
             const fmt = (iso) => (typeof iso === 'string' ? iso.slice(0, 10) : '')
             subtitleParts.push(`${fmt(search.data.since) || '最早'} ~ ${fmt(search.data.until) || '今天'}`)
           }
-          subtitleParts.push(query.deep ? '范围：标题+正文' : '范围：标题/首句')
+          if (query.q !== '') subtitleParts.push(query.deep ? '范围：标题+正文' : '范围：标题/首句')
           if (search.data?.rangeClamped === true) {
             subtitleParts.push(`单次最多 ${search.data.maxSpanDays ?? 31} 天（已自动收窄）`)
           }
@@ -988,6 +991,11 @@ window.__ModuleLoader__.load({
               listBody = React.createElement('div', null,
                 shown.map((session) => {
                   const id = typeof session.id === 'string' ? session.id : ''
+                  // 没填关键词时这是「时间段内的全部会话」，不是命中筛选——
+                  // 徽标按运行状态显示，与普通列表一致，别误导成“标题命中”。
+                  const badgeText = query.q === ''
+                    ? (session.running === true ? '运行中' : '该时段')
+                    : (session.searchField === 'body' ? '正文命中' : '标题命中')
                   return React.createElement('button', {
                     key: id,
                     type: 'button',
@@ -996,8 +1004,7 @@ window.__ModuleLoader__.load({
                     onClick: () => loadDump(id),
                   },
                   React.createElement('span', { style: styles.rowTop },
-                    React.createElement('span', { style: styles.badge(session.running === true) },
-                      session.searchField === 'body' ? '正文命中' : '标题命中'),
+                    React.createElement('span', { style: styles.badge(session.running === true) }, badgeText),
                     React.createElement('span', { style: styles.rowTitle }, nameOf(session))),
                   React.createElement('span', { style: styles.rowMeta }, session.cwd ?? '?'),
                   React.createElement('span', { style: styles.rowLine },
@@ -1078,7 +1085,13 @@ window.__ModuleLoader__.load({
               : null)
         }
 
+        // 选中的会话既可能在普通列表（ordered）里，也可能只在检索结果里：
+        // 搜索结果行同样要有「打开会话 / 取消归档」这些操作，所以两个来源都找。
+        const searchRows = searchActive && search.data !== null && Array.isArray(search.data.results)
+          ? search.data.results
+          : []
         const selected = ordered.find((session) => session && session.id === selectedId)
+          ?? searchRows.find((session) => session && session.id === selectedId)
 
         return React.createElement('div', { style: styles.page },
           React.createElement('header', { style: styles.header },
