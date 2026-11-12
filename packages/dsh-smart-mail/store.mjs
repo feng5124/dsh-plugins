@@ -435,6 +435,131 @@ export function putMessage(messageId, patch) {
   return next
 }
 
+/* ---------------------------------------------------------- 邮件托管提问单 */
+
+/**
+ * 托管提问的持久化（`hosting.json`）。
+ *
+ * 为什么要落盘：一问可能就是一夜。进程重启、桌面端升级、插件 HMR 都会
+ * 丢掉内存状态，而用户的回信第二天才来 —— 那时必须还能把答案对回原来的
+ * 会话与问题。所以提问单（含完整 questions，平台要求答案批量必须逐题
+ * 对应）必须落盘，且要在回信到达时仍然可读。
+ *
+ * 记录形状：
+ *   tickets[ticket] = {
+ *     ticket, callId, sessionId, sessionTitle,
+ *     questions,           // ask_user_question 原始问题（回灌答案时要用）
+ *     status,              // waiting | answered | expired | cancelled | failed
+ *     messageId,           // 我方发出的邮件 Message-ID（回信 References 兜底）
+ *     subject,
+ *     askedAt, updatedAt,
+ *     waitMs,              // 前台等待窗口
+ *     answers,             // 已解析出的答案（answering 之后）
+ *     deliveredVia,        // in-time | late | cancelled
+ *     error,
+ *   }
+ *   byMessageId[<msgid>] = ticket   // 回信只带 References 时的反查表
+ */
+const HOSTING_FILE = path.join(STATE_DIR, 'hosting.json')
+
+export function loadHosting() {
+  const value = readJson(HOSTING_FILE, null)
+  const store = value && typeof value === 'object' ? value : {}
+  store.tickets = store.tickets && typeof store.tickets === 'object' ? store.tickets : {}
+  store.byMessageId = store.byMessageId && typeof store.byMessageId === 'object' ? store.byMessageId : {}
+  store.version = 1
+  return store
+}
+
+export function saveHosting(store) {
+  const entries = Object.entries(store.tickets ?? {})
+  // 只保留还能被回信回答的、以及最近一周内结束的：更老的提问单回信也没用了。
+  if (entries.length > 200) {
+    const cutoff = Date.now() - 7 * 86_400_000
+    const kept = entries
+      .filter(([, value]) => value?.status === 'waiting' || value?.status === 'expired' || (value.updatedAt ?? 0) >= cutoff)
+      .sort((a, b) => (b[1]?.updatedAt ?? 0) - (a[1]?.updatedAt ?? 0))
+      .slice(0, 200)
+    store.tickets = Object.fromEntries(kept)
+    const live = new Set(kept.map(([ticket]) => ticket))
+    store.byMessageId = Object.fromEntries(
+      Object.entries(store.byMessageId ?? {}).filter(([, ticket]) => live.has(ticket)),
+    )
+  }
+  writeJson(HOSTING_FILE, store)
+  return store
+}
+
+export function getTicket(ticket) {
+  if (!ticket) return undefined
+  return loadHosting().tickets[ticket]
+}
+
+export function putTicket(ticket, patch) {
+  const store = loadHosting()
+  const previous = store.tickets[ticket] ?? {}
+  const next = { ...previous, ...patch, ticket, updatedAt: Date.now() }
+  if (previous.askedAt === undefined && next.askedAt === undefined) next.askedAt = Date.now()
+  store.tickets[ticket] = next
+  if (typeof next.messageId === 'string' && next.messageId !== '') store.byMessageId[next.messageId] = ticket
+  saveHosting(store)
+  return next
+}
+
+/** 回信只带 References 时，用我方发出的 Message-ID 反查提问单号。 */
+export function ticketForHostedMessage(messageId) {
+  if (!messageId) return undefined
+  return loadHosting().byMessageId[messageId]
+}
+
+/** 某会话当前还在等的提问单（面板/胶囊用）。 */
+export function ticketsForSession(sessionId) {
+  if (!sessionId) return []
+  return Object.values(loadHosting().tickets)
+    .filter((record) => record?.sessionId === sessionId)
+    .sort((a, b) => (b.askedAt ?? 0) - (a.askedAt ?? 0))
+}
+
+/** 全部提问单，最新在前（面板列表用）。 */
+export function listTickets() {
+  return Object.values(loadHosting().tickets).sort((a, b) => (b.askedAt ?? 0) - (a.askedAt ?? 0))
+}
+
+/**
+ * 「这个会话是邮件唤醒出来的」标记。
+ *
+ * 为什么单独存：邮件托管对邮件唤醒的会话**默认开启**（用户 2026-11-11 指定），
+ * 这个身份必须跨重启保留 —— 用户当天被邮件唤醒、第二天才在会话里被提问，
+ * 那时进程早就重启过了，光靠内存记不住。
+ *
+ * 存成一个 id -> 时间戳 的字典（不是数组）：重复唤醒同一会话不会堆积，
+ * 也便于按时间淘汰。
+ */
+export function loadMailWoken() {
+  const store = loadHosting()
+  const map = store.mailWoken
+  return map !== null && typeof map === 'object' && !Array.isArray(map) ? map : {}
+}
+
+export function markMailWoken(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return
+  const store = loadHosting()
+  if (store.mailWoken === null || typeof store.mailWoken !== 'object' || Array.isArray(store.mailWoken)) store.mailWoken = {}
+  store.mailWoken[sessionId] = Date.now()
+  // 上限 500：只留最近唤醒的，更老的会话托管已经回落到全局默认。
+  const entries = Object.entries(store.mailWoken)
+  if (entries.length > 500) {
+    entries.sort((a, b) => b[1] - a[1])
+    store.mailWoken = Object.fromEntries(entries.slice(0, 500))
+  }
+  saveHosting(store)
+}
+
+export function isMailWoken(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return false
+  return loadMailWoken()[sessionId] !== undefined
+}
+
 /* ----------------------------------------------------------- config memory */
 
 export function loadLastConfig() {

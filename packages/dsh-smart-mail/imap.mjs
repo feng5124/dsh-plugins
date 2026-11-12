@@ -567,11 +567,14 @@ export function parseHeaderText(headerText) {
 export async function fetchThreaded(session, uids, fields) {
   if (uids.length === 0) return []
   const list = fields.join(' ')
+  // 16 KiB 而不是 4 KiB：邮件托管的回信要走这里解析答案（2026-11-11）。
+  // 4 KiB 对"引用一整封原始问题 + 在下面写答案"的回复会被截断，导致解析
+  // 只看到引用块。16 KiB 仍是有界抽取，不改变轮询的流量量级。
   const lines = await session.exec([
     'UID',
     'FETCH',
     uids.join(','),
-    `(UID BODY.PEEK[HEADER.FIELDS (${list})] BODY.PEEK[TEXT]<0.4096>)`,
+    `(UID BODY.PEEK[HEADER.FIELDS (${list})] BODY.PEEK[TEXT]<0.16384>)`,
   ])
   const out = []
   for (const line of lines) {

@@ -11,6 +11,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const { useState, useEffect, useCallback, useRef } = React
+    const MAX_WIDTH = 1040
 
     const API = '/smart-mail'
     const TAB_ID = 'smart-mail'
@@ -30,30 +31,33 @@ window.__ModuleLoader__.load({
 
     const styles = {
       page: {
-        boxSizing: 'border-box', height: '100%', overflowY: 'auto', padding: '20px 24px 60px',
+        boxSizing: 'border-box', height: '100%', overflowY: 'auto', padding: '28px 28px 64px',
         background: COLOR.surface, color: COLOR.text,
         font: '13px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
       },
-      title: { margin: '0 0 4px', fontSize: 18, fontWeight: 600 },
-      subtitle: { color: COLOR.muted, fontSize: 12, marginBottom: 18 },
+      content: { maxWidth: MAX_WIDTH, margin: '0 auto' },
+      title: { margin: '0 0 5px', fontSize: 22, fontWeight: 650, letterSpacing: '-0.02em' },
+      subtitle: { color: COLOR.muted, fontSize: 13, margin: 0, lineHeight: 1.7 },
       section: {
-        background: COLOR.raised, border: `1px solid ${COLOR.border}`, borderRadius: 10,
-        padding: '14px 16px', marginBottom: 14,
+        background: COLOR.raised, border: `1px solid ${COLOR.border}`, borderRadius: 12,
+        padding: '20px', marginBottom: 16,
       },
-      sectionTitle: { margin: '0 0 10px', fontSize: 14, fontWeight: 600 },
-      row: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 },
-      label: { flex: '0 0 110px', color: COLOR.muted, fontSize: 12 },
+      sectionTitle: { margin: 0, fontSize: 15, fontWeight: 600 },
+      sectionHead: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, marginBottom: 16 },
+      row: { display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 },
+      label: { flex: '0 0 120px', color: COLOR.muted, fontSize: 12 },
+      card: { background: COLOR.nested, border: `1px solid ${COLOR.border}`, borderRadius: 10, padding: '14px 16px' },
       input: {
-        flex: '1 1 220px', minWidth: 0, boxSizing: 'border-box', padding: '6px 10px', borderRadius: 8,
+        flex: '1 1 260px', minWidth: 0, boxSizing: 'border-box', padding: '8px 11px', borderRadius: 8,
         border: `1px solid ${COLOR.border}`, background: COLOR.nested, color: 'inherit', font: 'inherit',
       },
       button: {
-        cursor: 'pointer', padding: '6px 14px', borderRadius: 8, border: `1px solid ${COLOR.border}`,
-        background: COLOR.raised, color: 'inherit', font: 'inherit',
+        cursor: 'pointer', padding: '7px 13px', borderRadius: 8, border: `1px solid ${COLOR.border}`,
+        background: COLOR.raised, color: 'inherit', font: 'inherit', whiteSpace: 'nowrap',
       },
       buttonPrimary: {
-        cursor: 'pointer', padding: '6px 14px', borderRadius: 8, border: `1px solid ${COLOR.accent}`,
-        background: COLOR.nested, color: COLOR.text, font: 'inherit',
+        cursor: 'pointer', padding: '7px 13px', borderRadius: 8, border: `1px solid ${COLOR.accent}`,
+        background: COLOR.nested, color: COLOR.text, font: 'inherit', whiteSpace: 'nowrap',
       },
       notice: { padding: '8px 12px', borderRadius: 8, fontSize: 12, marginTop: 8, overflowWrap: 'anywhere' },
       noticeOk: { color: COLOR.ok, background: COLOR.nested },
@@ -102,6 +106,49 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.row },
         h('div', { style: styles.label }, label),
         children)
+    }
+
+    function SectionHeading({ title, description, action }) {
+      return h('div', { style: styles.sectionHead },
+        h('div', null,
+          h('h2', { style: styles.sectionTitle }, title),
+          description ? h('div', { style: { ...styles.subtitle, marginTop: 4 } }, description) : null),
+        action ?? null)
+    }
+
+    function Toggle({ on, onClick, label, disabled = false }) {
+      return h('button', {
+        type: 'button', role: 'switch', 'aria-checked': on, disabled,
+        'aria-label': label,
+        onClick,
+        style: {
+          position: 'relative', flex: '0 0 auto', width: 36, height: 20, padding: 0,
+          borderRadius: 10, border: `1px solid ${on ? COLOR.accent : COLOR.border}`,
+          background: on ? COLOR.accent : COLOR.nested,
+          cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1,
+        },
+      }, h('span', {
+        'aria-hidden': true,
+        style: {
+          position: 'absolute', top: 2, left: on ? 18 : 2, width: 14, height: 14,
+          borderRadius: '50%', background: on ? COLOR.raised : COLOR.muted,
+          transition: 'left 140ms ease',
+        },
+      }))
+    }
+
+    function SettingRow({ title, description, on, onToggle, disabled = false, children }) {
+      return h('div', {
+        style: {
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 18,
+          padding: '14px 0', borderTop: `1px solid ${COLOR.border}`,
+        },
+      },
+        h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+          h('div', { style: { fontWeight: 500 } }, title),
+          h('div', { style: { ...styles.help, marginTop: 3 } }, description),
+          children ?? null),
+        onToggle ? h(Toggle, { on, onClick: onToggle, label: title, disabled }) : null)
     }
 
     /**
@@ -565,6 +612,12 @@ window.__ModuleLoader__.load({
       // 轮询覆盖：聚焦期间冻结刷新回写，blur 后恢复（number-field 的同类修复，
       // 文本输入期间超过 8 秒会被服务端值冲掉）。
       const editingRef = useRef(false)
+      // 邮件托管：一次返回配置、实际收件人和提问单，不再让页面拼多个接口。
+      const [hosting, setHosting] = useState(null)
+      const [hostingNotice, setHostingNotice] = useState(null)
+      const [hostingBusy, setHostingBusy] = useState(false)
+      const [activeView, setActiveView] = useState('overview')
+      const hostingLoadedRef = useRef(false)
 
       /** 只刷新值得每 8 秒刷的：状态（开关、摘要、日志、轮询间隔）。 */
       const refreshStatus = useCallback(async () => {
@@ -633,6 +686,20 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer)
       }, [refreshStatus])
 
+      const loadHosting = useCallback(async () => {
+        try {
+          const data = await api('/hosting')
+          if (data.ok === true) setHosting(data)
+        } catch { /* 面板其余部分照常可用 */ }
+      }, [])
+
+      // 配置和活跃提问单只在进入页面时读取，不打断正在编辑的表单。
+      useEffect(() => {
+        if (hostingLoadedRef.current) return
+        hostingLoadedRef.current = true
+        void loadHosting()
+      }, [loadHosting])
+
       const setDraftField = (key, value) => setDraft((d) => {
         const next = { ...d, [key]: value }
         if (key === 'preset') {
@@ -695,8 +762,37 @@ window.__ModuleLoader__.load({
         await refreshStatus()
       }
 
-      /** Pin (or clear) the model one thread's session should use. */
-      const saveThreadModel = async (tag, selection) => {
+      /**
+       * 邮件托管的保存：走自己的 /hosting 路由（不是 /config）。
+       *
+       * 原因：/config 只在 changedFields 非空时写回 profile，而 hosting 是嵌套
+       * 对象，panel 里的部分字段改动在旧口径下容易被判成"没变"。单独一条路由
+       * 能把"改了哪一层、有没有落盘"直接回给界面。
+       */
+      const saveHosting = async (patch) => {
+        if (hostingBusy) return
+        setHostingBusy(true)
+        setHostingNotice(null)
+        try {
+          const result = await api('/hosting', { method: 'POST', body: JSON.stringify(patch) })
+          if (result.ok !== true) {
+            setHostingNotice({ ok: false, text: `保存失败：${result.error ?? '未知原因'}` })
+            return
+          }
+          await loadHosting()
+          if (result.persisted === false) {
+            setHostingNotice({ ok: false, text: `已生效，但没能写回 profile 配置（重启会丢失）：${result.persistError ?? '未知原因'}` })
+          } else {
+            setHostingNotice({ ok: true, text: '设置已保存' })
+          }
+        } catch (cause) {
+          setHostingNotice({ ok: false, text: `保存失败：${cause instanceof Error ? cause.message : String(cause)}` })
+        } finally {
+          setHostingBusy(false)
+        }
+      }
+
+      /** Pin (or clear) the model one thread's session should use. */      const saveThreadModel = async (tag, selection) => {
         const result = await api('/thread-model', {
           method: 'POST',
           body: JSON.stringify({ tag, selection }),
@@ -721,14 +817,45 @@ window.__ModuleLoader__.load({
 
       const presets = status?.presets ?? {}
 
+      const navigation = [
+        ['overview', '收信与唤醒', '账号、白名单和自动收信'],
+        ['hosting', '邮件托管', '离开页面也能回答问题、接收结果'],
+      ]
+
       return h('div', { style: styles.page },
-        h('h1', { style: styles.title }, '智能邮箱 dsh-smart-mail'),
-        h('div', { style: styles.subtitle },
-          '白名单内的发件人来新邮件时唤醒 DSH 会话；回复同一邮件线程会续接原会话。'),
+        h('div', { style: styles.content },
+        h('h1', { style: styles.title }, '智能邮箱'),
+        h('div', { style: styles.subtitle }, '用邮件接收任务、回复问题，让 DSH 在你离开页面后继续工作。'),
+        h('div', {
+          role: 'tablist', 'aria-label': '邮箱设置分类',
+          style: { display: 'flex', gap: 6, margin: '22px 0 20px', borderBottom: `1px solid ${COLOR.border}` },
+        }, navigation.map(([id, label, description]) => h('button', {
+          key: id, type: 'button', role: 'tab', 'aria-selected': activeView === id,
+          title: description,
+          onClick: () => setActiveView(id),
+          style: {
+            padding: '9px 14px 11px', border: 0, borderBottom: `2px solid ${activeView === id ? COLOR.accent : 'transparent'}`,
+            background: 'transparent', color: activeView === id ? COLOR.text : COLOR.muted,
+            font: 'inherit', fontWeight: activeView === id ? 600 : 400, cursor: 'pointer',
+          },
+        }, label))),
 
         notice === null ? null : h('div', {
           style: { ...styles.notice, ...(notice.ok ? styles.noticeOk : styles.noticeError) },
         }, notice.text),
+
+        activeView === 'hosting'
+          ? h(HostingSection, {
+            hosting: hosting?.hosting,
+            owner: hosting?.owner,
+            accounts: hosting?.accounts ?? [],
+            active: hosting?.active ?? [],
+            saveHosting,
+            refresh: loadHosting,
+            notices: hostingNotice === null ? [] : [hostingNotice],
+            busy: hostingBusy,
+          })
+          : h(React.Fragment, null,
 
         // ---- ⓪ 自动收信总览：页面最顶上的“现在到底在不在自动收信” ------
         h('div', { style: styles.section },
@@ -959,6 +1086,7 @@ window.__ModuleLoader__.load({
                 groups: catalog?.groups ?? [],
                 onSave: (tag, selection) => saveThreadModel(tag, selection),
               })))))
+        ))
     }
 
     /** One thread row: identity, the session it maps to, and its model pin. */
@@ -994,7 +1122,243 @@ window.__ModuleLoader__.load({
             }, model.name ?? model.id))))))
     }
 
+    /* ------------------------------------------------- 会话内：邮件托管胶囊 */
+
+    /**
+     * composer 左侧的「邮件托管」开关胶囊。
+     *
+     * 位置选择（2026-11-11 与用户确认）：`conversation.input.left`，和
+     * 「Computer Use」同一排。Computer Use 占 order 24，所以这里用 25 紧跟其后，
+     * 不与它抢位；也不用 `sidebar.right.pane.tab`（上下文洞察在用，且点开才看得见，
+     * 启用态不够一目了然）。
+     *
+     * 视觉（2026-11-12 用户指定，替换旧的"边框+底色"方案）：
+     *   - 无外框、无底色，只有一个 ✉ 图标 + 「邮件托管」四个字；
+     *   - 关闭：灰黑色（次级文字色）常规字重；
+     *   - 开启：加粗黑色（主文字色）。
+     * 状态只靠字重/颜色区分，右侧不再带「已开/已关」字样。
+     */
+    const PILL_SLOT = 'conversation.input.left'
+    const PILL_ID = 'smart-mail-hosting'
+    const PILL_ORDER = 25
+
+    function HostingPill(props) {
+      const sessionId = typeof props === 'string' ? props : (props?.sessionId ?? null)
+      const [state, setState] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [hover, setHover] = useState(false)
+
+      const load = useCallback(async () => {
+        try {
+          const data = await api(`/hosting${sessionId === null ? '' : `?sessionId=${encodeURIComponent(sessionId)}`}`)
+          setState(data)
+        } catch {
+          setState(null)
+        }
+      }, [sessionId])
+
+      useEffect(() => { void load() }, [load])
+      // 12 秒一次：胶囊要能反映"刚被提问、邮件已发出"，但不能太吵。
+      useEffect(() => {
+        const timer = setInterval(() => { void load() }, 12000)
+        return () => clearInterval(timer)
+      }, [load])
+
+      if (sessionId === null || state === null || state.ok !== true) return null
+
+      const hosting = state.hosting ?? {}
+      const override = hosting.sessions?.[sessionId]
+      // 与宿主同口径：显式覆盖 > 邮件唤醒(默认开) > 全局默认
+      const mailWoken = state.mailWoken === true
+      const enabled = override === true || (override === undefined && (mailWoken || hosting.defaultEnabled === true))
+      const fromMail = override === undefined && mailWoken
+
+      const toggle = async () => {
+        if (busy) return
+        setBusy(true)
+        try {
+          await api('/hosting', {
+            method: 'POST',
+            body: JSON.stringify({ sessionId, sessionEnabled: !enabled }),
+          })
+          await load()
+        } catch { /* 下一次轮询会纠正 UI */ } finally { setBusy(false) }
+      }
+
+      const pill = {
+        display: 'inline-flex', alignItems: 'center', gap: 5,
+        height: 28, padding: '0 6px', borderRadius: 8,
+        cursor: busy ? 'progress' : 'pointer', userSelect: 'none',
+        font: '12px/1 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
+        background: 'transparent',
+        border: 'none',
+        color: enabled ? COLOR.text : COLOR.muted,
+        fontWeight: enabled ? 700 : 400,
+        opacity: busy ? 0.6 : 1,
+        transition: 'color 120ms',
+        ...(hover ? { color: COLOR.text } : {}),
+      }
+
+      const icon = h('span', {
+        'aria-hidden': 'true',
+        style: { fontSize: 13, lineHeight: 1 },
+      }, '✉')
+
+      const label = '邮件托管'
+
+      return h('button', {
+        type: 'button',
+        style: pill,
+        role: 'switch',
+        'aria-checked': enabled,
+        'aria-label': `邮件托管：${enabled ? '已启用' : '未启用'}${fromMail ? '（邮件唤醒会话默认开启）' : ''}，点击${enabled ? '关闭' : '开启'}`,
+        title: enabled
+          ? `邮件托管已启用：这个会话向你提问时会发邮件给你${fromMail ? '（邮件唤醒的会话默认开启）' : ''}。点击可关闭。`
+          : '邮件托管已关闭：提问只在本页面弹窗。点击可开启，之后提问会发邮件给你，你回信即作答。',
+        onClick: toggle,
+        onMouseEnter: () => setHover(true),
+        onMouseLeave: () => setHover(false),
+      }, icon, h('span', null, label))
+    }
+
+    /* --------------------------------------------------- 设置页：邮件托管区块 */
+
+    /**
+     * 设置页的「邮件托管」区块。
+     *
+     * 三层开关（用户 2026-11-11 指定）：
+     *   ① 总开关 —— 关掉后任何会话都不发托管邮件（一票否决）；
+     *   ② 默认值 —— **非**邮件唤醒的会话默认开还是关；
+     *   ③ 单会话覆盖 —— 会话内胶囊里的开关，写进 hosting.sessions。
+     * 另外明确展示「邮件唤醒的会话默认开启」这条规则，免得用户以为它跟随②。
+     */
+    function HostingSection({ hosting, owner, accounts, active = [], saveHosting, refresh, notices, busy = false }) {
+      const [ownerDraft, setOwnerDraft] = useState(null)
+      if (hosting === null || hosting === undefined) {
+        return h('div', { style: styles.section }, '正在读取邮件托管设置…')
+      }
+
+      const cfg = hosting
+      const enabled = cfg.enabled !== false
+      const overrideCount = Object.keys(cfg.sessions ?? {}).length
+      const actualOwner = owner || cfg.owner || '尚未配置'
+      const toggle = (field) => () => void saveHosting({ [field]: !cfg[field] })
+      const steps = [
+        ['1', 'DSH 发邮件', '遇到需要你决定的问题时，发到你的邮箱。'],
+        ['2', '直接回复邮件', '回选项编号或文字，不必回到这个页面。'],
+        ['3', '任务自动继续', '答案送回原来的会话；超时挂起后也能回信。'],
+      ]
+
+      return h(React.Fragment, null,
+        h(SectionHeading, {
+          title: '邮件托管',
+          description: '不守着会话页面，也能通过邮件回答问题、接收任务结果。',
+          action: h('span', { style: styles.badge(enabled) }, enabled ? '功能已开启' : '功能已关闭'),
+        }),
+
+        // 第一屏只回答“开没开、发给谁、怎么用”，不再直接堆叠技术参数。
+        h('div', { style: styles.card },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 18 } },
+            h('div', null,
+              h('div', { style: { fontSize: 15, fontWeight: 600 } }, '允许通过邮件与我沟通'),
+              h('div', { style: { ...styles.help, marginTop: 4 } },
+                enabled ? '适用于已开启托管的会话；关闭后，所有提问都回到页面弹窗。' : '当前不会发送托管提问或任务结果邮件。')),
+            h(Toggle, { on: enabled, onClick: toggle('enabled'), label: '邮件托管总开关', disabled: busy })),
+          h('div', {
+            style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14, paddingTop: 12, borderTop: `1px solid ${COLOR.border}` },
+          },
+            h('span', { style: styles.help }, `接收邮箱：${actualOwner}`),
+            h('span', { style: styles.help }, '·'),
+            h('span', { style: styles.help }, `发信账号：${accounts.length > 0 ? accounts.map((a) => a.address).join('、') : '尚未配置'}`)),
+          enabled ? null : h('div', { style: { ...styles.help, marginTop: 8, color: COLOR.error } },
+            '总开关已关闭。下面的单独设置会保留，重新开启后恢复生效。')),
+
+        h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 10, margin: '14px 0 20px' } },
+          steps.map(([number, title, description]) => h('div', { key: number, style: { ...styles.card, padding: '12px 14px' } },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 } },
+              h('span', { style: { ...styles.badge(true), minWidth: 18, textAlign: 'center' } }, number), title),
+            h('div', { style: { ...styles.help, marginTop: 6 } }, description)))),
+
+        h('div', { style: styles.section },
+          h(SectionHeading, {
+            title: `等待回复${active.length > 0 ? `（${active.length}）` : ''}`,
+            description: active.length > 0 ? '到邮箱找到对应邮件，直接回复即可。' : '当前没有需要你回答的问题。',
+            action: h('button', { type: 'button', style: styles.button, onClick: () => { void refresh() } }, '刷新'),
+          }),
+          active.length === 0 ? null : active.slice(0, 10).map((ticket) => h('div', {
+            key: ticket.ticket, style: { ...styles.card, marginBottom: 8 },
+          },
+            h('div', { style: { fontWeight: 600 } }, ticket.sessionTitle ?? ticket.sessionId ?? '未命名会话'),
+            h('div', { style: { ...styles.help, margin: '3px 0 6px' } },
+              `${ticket.questionCount} 个问题 · ${ticket.askedAtLocal ?? ''} · ${ticket.status === 'waiting' ? '会话正在等待' : '已挂起，仍可回复'} · 单号 ${ticket.ticket}`),
+            (ticket.questions ?? []).map((q, i) => h('div', { key: q.id ?? i, style: { marginTop: 3 } }, `${i + 1}. ${q.question}`))))),
+
+        h('div', { style: styles.section },
+          h(SectionHeading, { title: '通知与适用范围', description: '决定哪些会话使用托管，以及是否额外发送完成通知。' }),
+          h(SettingRow, {
+            title: '任务完成后发送结果邮件', on: cfg.notifyResult === true, onToggle: toggle('notifyResult'), disabled: !enabled || busy,
+            description: cfg.notifyResult === true ? '每轮完成后发送结果，相同内容不会重复发送。' : '只发送需要回答的问题，不发送完成通知。',
+          },
+            cfg.notifyResult === true ? h('div', { style: { marginTop: 10 } },
+              h(Field, { label: '结果正文上限' }, h(NumberField, {
+                value: cfg.resultMaxChars ?? 4000, min: 200, step: 500, unit: '字；超出后截断',
+                onCommit: (next) => void saveHosting({ resultMaxChars: Math.max(200, Number(next) || 4000) }),
+              }))) : null),
+          h(SettingRow, {
+            title: '普通会话默认开启', on: cfg.defaultEnabled === true, onToggle: toggle('defaultEnabled'), disabled: !enabled || busy,
+            description: cfg.defaultEnabled === true
+              ? '新建的页面会话默认使用邮件托管。'
+              : '页面会话默认不使用；可在会话输入框左侧单独开启「邮件托管」。',
+          }),
+          h(SettingRow, {
+            title: '邮件唤醒的会话默认开启',
+            description: '通过来信启动的会话会自动使用邮件托管，不受上一项影响；仍可在单个会话里关闭。',
+          }),
+          h('div', { style: { ...styles.help, paddingTop: 10, borderTop: `1px solid ${COLOR.border}` } },
+            `已单独设置 ${overrideCount} 个会话。单个会话的设置优先于这里的默认规则。`)),
+
+        h('div', { style: styles.section },
+          h(SectionHeading, { title: '投递设置', description: '保存后立即生效，并写入本机配置。' }),
+          h(Field, { label: '接收邮箱' },
+            h('input', {
+              style: styles.input, type: 'email', value: ownerDraft ?? (cfg.owner ?? ''),
+              placeholder: '留空则使用白名单中的第一个完整邮箱地址',
+              onFocus: () => { if (ownerDraft === null) setOwnerDraft(cfg.owner ?? '') },
+              onChange: (e) => setOwnerDraft(e.target.value),
+              onBlur: () => {
+                if (ownerDraft !== null && ownerDraft.trim() !== (cfg.owner ?? '')) void saveHosting({ owner: ownerDraft.trim() })
+                setOwnerDraft(null)
+              },
+            })),
+          h('div', { style: { ...styles.help, margin: '-4px 0 12px 132px' } },
+            `这是你的收件地址，不是发信账号。当前实际发送到：${actualOwner}。`),
+          h(Field, { label: '前台等待时间' },
+            h(NumberField, {
+              value: Math.round((cfg.waitMs ?? 60000) / 1000), min: 5, step: 15, unit: '秒',
+              onCommit: (next) => void saveHosting({ waitMs: Math.max(5, Number(next) || 60) * 1000 }),
+            })),
+          h('div', { style: { ...styles.help, margin: '-4px 0 0 132px' } },
+            '不是回信截止期限。到点后问题转为挂起，之后回复仍然有效。'),
+          h('details', { style: { marginTop: 16, color: COLOR.muted } },
+            h('summary', { style: { cursor: 'pointer' } }, '回信格式说明'),
+            h('div', { style: { ...styles.help, marginTop: 8 } },
+              '单个问题：直接回复选项编号或文字。多个问题：每行以问题编号开头，例如“1. 2”。回复“取消”可作废提问；邮件客户端自动附带的引用内容会被忽略。'))),
+
+        notices?.length > 0
+          ? h('div', { style: { ...styles.notice, ...(notices.every((n) => n.ok) ? styles.noticeOk : styles.noticeError) } },
+            notices.map((n) => n.text).join(' '))
+          : null)
+    }
+
     function apply(ctx) {
+      ctx.effect(() => ctx.slots.inject(PILL_SLOT, () => ctx.slots.register({
+        name: PILL_SLOT,
+        id: PILL_ID,
+        order: PILL_ORDER,
+        label: () => '邮件托管',
+        inject: (sessionId) => ({ sessionId }),
+      }, HostingPill)), 'smart-mail: hosting pill')
+
       ctx.effect(() => ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
         name: 'settings.plugins.tab',
         id: TAB_ID,

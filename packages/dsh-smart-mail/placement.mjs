@@ -52,8 +52,8 @@ import { homedir } from 'node:os'
  */
 export function sessionProjectDirectory(directory) {
   // The drive colon is dropped (`E:\...` -> `E-...`), every separator becomes
-  // `-`, and the whole thing is wrapped in `--`. Verified against the real
-  // directories: `--E-deepseek-harness-default-workspace--`.
+  // `-`, and the whole thing is wrapped in `--`. Example: `D:\my project`
+  // becomes `--D-my-project--`.
   const body = directory
     .replace(/^([A-Za-z]):/, '$1')
     .replace(/[\\/]/g, '-')

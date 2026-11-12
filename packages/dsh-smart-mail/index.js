@@ -69,6 +69,7 @@ import {
   newMessageId,
   newTag,
   normalizeMessageId,
+  shortId,
   tagFromSubject,
   tagSubject,
   detectLoop,
@@ -76,6 +77,8 @@ import {
   IgnoreReason,
 } from './threads.mjs'
 import { DeliveryMode, deliverToSession, sessionState, wakeWithMail } from './wake.mjs'
+import { createHosting } from './hosting-host.mjs'
+import { isMailWoken, listTickets, markMailWoken, ticketsForSession } from './store.mjs'
 import { WakePlacement, explainPlacement, normalizePlacement, readWorkspaceCatalog } from './placement.mjs'
 import { applySessionModel, chooseSelection, describeSelection, isSelection, readCatalog } from './model-choice.mjs'
 
@@ -197,12 +200,123 @@ function normalizeConfig(config) {
       if (raw.split(/[\\/]+/).some((seg) => seg === '..')) return ''
       return path.resolve(raw)
     })(),
+    /**
+     * 邮件托管：把 `ask_user_question` 的提问转成邮件，回信即答案。
+     *
+     * 语义（2026-11-11 用户指定）：
+     *   - `enabled:false` 一票否决，全局关掉后任何会话都不发托管邮件；
+     *   - `defaultEnabled`：**非**邮件唤醒会话的默认值；
+     *   - `sessions[sessionId]`：单会话覆盖（true/false），优先级最高；
+     *   - **邮件唤醒出来的会话默认开启**，与 defaultEnabled 无关（用户明确要求）；
+     *   - `waitMs` 前台等待窗口，到点后问题挂起（pending），晚到的回信仍可回灌；
+     *   - `owner` 收件人，留空则取白名单第一个地址（= 用户邮箱）。
+     */
+    hosting: (() => {
+      const raw = config?.hosting
+      const obj = raw !== null && typeof raw === 'object' ? raw : {}
+      const sessions = {}
+      if (obj.sessions !== null && typeof obj.sessions === 'object' && !Array.isArray(obj.sessions)) {
+        for (const [sessionId, value] of Object.entries(obj.sessions)) {
+          if (typeof sessionId !== 'string' || sessionId === '') continue
+          if (typeof value === 'boolean') sessions[sessionId] = value
+        }
+      }
+      const waitRaw = Number(obj.waitMs ?? 60_000)
+      // 下限 5 秒：再短就等于必然超时，托管变摆设；上限 24 小时。
+      const waitMs = Number.isFinite(waitRaw) ? Math.min(24 * 3600_000, Math.max(5_000, waitRaw)) : 60_000
+      // 结果邮件的正文上限：太长会把邮箱塞爆，太短又看不到结论。
+      const charsRaw = Number(obj.resultMaxChars ?? 4000)
+      const resultMaxChars = Number.isFinite(charsRaw) ? Math.min(20_000, Math.max(200, charsRaw)) : 4000
+      return {
+        enabled: obj.enabled !== false,
+        defaultEnabled: obj.defaultEnabled === true,
+        /**
+         * 托管开启时，任务完成也把结果发邮件（2026-11-11 用户要求）。
+         * 默认 **false**：提问要人答，所以发信是托管本身的意义；完成通知是
+         * 额外打扰，得用户显式打开，否则每个邮件唤醒的会话都会多回一封信。
+         */
+        notifyResult: obj.notifyResult === true,
+        resultMaxChars,
+        waitMs,
+        owner: typeof obj.owner === 'string' ? obj.owner.trim() : '',
+        account: typeof obj.account === 'string' ? obj.account.trim() : '',
+        sessions,
+      }
+    })(),
   }
 }
 
 /** The rotation knobs `appendLog` takes. */
 function rotationOf(cfg) {
   return { maxBytes: cfg.logMaxBytes, keepDays: cfg.logKeepDays, keepFiles: cfg.logKeepFiles }
+}
+
+/**
+ * Mint a thread tag for a Session that has never sent mail before.
+ *
+ * Deterministic on purpose (`shortId(sessionId)`): two sends from the same
+ * Session must carry the same tag, or the user's replies would fan out across
+ * several threads. The salt loop only runs on the (1/65536) collision with a
+ * tag already owned by a *different* Session — silently reusing someone else's
+ * tag would route the reply into the wrong conversation.
+ *
+ * @param {string} sessionId
+ * @returns {string} 4-hex-char tag
+ */
+function tagForNewSession(sessionId) {
+  for (let salt = 0; salt < 8; salt += 1) {
+    const candidate = shortId(salt === 0 ? sessionId : `${sessionId}#${salt}`, 4)
+    const owner = sessionForTag(candidate)
+    if (owner === undefined || owner === sessionId) return candidate
+  }
+  // Astronomically unlikely; a random tag can never collide with the 8 tried.
+  return newTag(`${sessionId}:${Date.now()}`)
+}
+
+/**
+ * 邮件托管的收件人：显式 hosting.owner 优先，否则取白名单第一个地址。
+ *
+ * 白名单就是「用户本人的邮箱」（2026-11-11 用户明确纠正过：163 那个是我发信用的
+ * 机器账号，不是他的邮箱），所以这里绝不能用 accounts[].address 当收件人。
+ */
+function pickHostingOwner(cfg) {
+  const explicit = typeof cfg?.hosting?.owner === 'string' ? cfg.hosting.owner.trim() : ''
+  if (explicit !== '') return explicit
+  const first = (cfg?.allowFrom ?? []).map(String).map((item) => item.trim()).find((item) => item !== '')
+  return first ?? null
+}
+
+/**
+ * 面板可见的提问单视图：不含 agent/内部字段，也不含完整问题正文（太长），
+ * 只留「哪个会话、问了几题、什么状态、什么时候」。
+ */
+function publicTicket(ticket) {
+  return {
+    ticket: ticket.ticket,
+    sessionId: ticket.sessionId ?? null,
+    sessionTitle: ticket.sessionTitle ?? null,
+    status: ticket.status,
+    questionCount: Array.isArray(ticket.questions) ? ticket.questions.length : 0,
+    questions: Array.isArray(ticket.questions)
+      ? ticket.questions.map((question) => ({
+        id: question?.id ?? null,
+        header: question?.header ?? null,
+        question: String(question?.question ?? '').slice(0, 200),
+        options: Array.isArray(question?.options) ? question.options.map((option) => option.label) : [],
+        multiSelect: question?.multiSelect === true,
+      }))
+      : [],
+    subject: ticket.subject ?? null,
+    messageId: ticket.messageId ?? null,
+    askedAt: ticket.askedAt ?? null,
+    askedAtLocal: ticket.askedAt ? new Date(ticket.askedAt).toLocaleString('sv-SE') : null,
+    updatedAt: ticket.updatedAt ?? null,
+    waitMs: ticket.waitMs ?? null,
+    answeredCount: ticket.answeredCount ?? null,
+    skipped: ticket.skipped ?? null,
+    deliveredVia: ticket.deliveredVia ?? null,
+    error: ticket.error ?? null,
+  }
 }
 
 /** Fields compared to decide whether the effective config really changed. */
@@ -224,6 +338,7 @@ const CONFIG_FIELDS = [
   'logKeepFiles',
   'attachmentKeepDays',
   'attachmentDir',
+  'hosting',
 ]
 
 /** Which config fields differ between two effective configs. */
@@ -259,6 +374,14 @@ function configDigest(cfg) {
     continueThreads: cfg.continueThreads,
     autoUnarchive: cfg.autoUnarchive,
     log: { maxBytes: cfg.logMaxBytes, keepDays: cfg.logKeepDays, keepFiles: cfg.logKeepFiles },
+    hosting: {
+      enabled: cfg.hosting.enabled,
+      defaultEnabled: cfg.hosting.defaultEnabled,
+      notifyResult: cfg.hosting.notifyResult,
+      waitMs: cfg.hosting.waitMs,
+      sessionOverrides: Object.keys(cfg.hosting.sessions).length,
+      owner: cfg.hosting.owner === '' ? null : cfg.hosting.owner,
+    },
   }
 }
 
@@ -380,7 +503,7 @@ function senderSummary(entries) {
  *   - every whitelisted message that is acted on produces one `mail-wake`
  *     line with its full outcome and the headers needed to debug it.
  */
-async function pollAccount(ctx, account, cfg, log) {
+async function pollAccount(ctx, account, cfg, log, hosting) {
   const session = await openMailbox(account)
   try {
     await selectInbox(session)
@@ -464,6 +587,39 @@ async function pollAccount(ctx, account, cfg, log) {
 
     const woke = []
     for (const mail of acted) {
+      // 先问邮件托管：这封是不是「回答托管提问」的回信？
+      // 必须排在普通唤醒之前 —— 否则同一封回信会被当成新指令再唤醒一次，
+      // 会话既收到 answer_to_pending_question 又收到一条「处理这封邮件」的
+      // prompt，两条互相打架，还可能诱发再次发信形成环。
+      if (hosting !== null && hosting !== undefined && cfg.hosting.enabled) {
+        const reply = await hosting.deliverReply({
+          subject: mail.subject,
+          text: mail.text ?? mail.preview ?? '',
+          inReplyTo: mail.inReplyTo,
+          references: messageIdsIn(headerValue(mail.headers, 'references') ?? ''),
+          messageId: mail.messageId,
+          from: mail.from,
+        })
+        if (reply.handled) {
+          putMessage(mail.messageId ?? `uid:${account.id}:${mail.uid}`, {
+            kind: 'hosting-reply',
+            ticket: reply.ticket ?? null,
+            delivered: reply.delivered ?? reply.reason ?? null,
+            from: mail.from,
+            subject: mail.subject,
+            stage: 'done',
+          })
+          woke.push({
+            from: mail.from,
+            subject: mail.subject,
+            route: 'hosting-reply',
+            ok: !String(reply.delivered ?? '').startsWith('failed'),
+            sessionId: null,
+            ticket: reply.ticket ?? null,
+          })
+          continue
+        }
+      }
       const result = await handleMail(ctx, account, mail, cfg)
       woke.push({
         from: mail.from,
@@ -709,6 +865,10 @@ async function handleMail(ctx, account, mail, cfg) {
     wakeProjectDir: wake.projectDirectory ?? null,
     ...modelInfo,
   }, rotationOf(cfg))
+  // 记下「这个会话是邮件唤醒出来的」：邮件托管对这类会话默认开启（用户
+  // 2026-11-11 明确要求），与全局 defaultEnabled 无关。必须落盘，因为用户在
+  // 会话里提问可能是明天的事，那时进程早已重启。
+  markMailWoken(wake.sessionId)
   return { ok: true, sessionId: wake.sessionId, route }
 }
 
@@ -873,9 +1033,17 @@ const plugin = {
           if (args.inReplyTo !== undefined && args.inReplyTo !== null && args.inReplyTo !== '' && parentId === undefined) {
             return { ok: false, error: `inReplyTo is not a Message-ID: ${String(args.inReplyTo).slice(0, 120)} (expected <id@host>)` }
           }
-          const tag = args.threadTag
+          // 为什么必须 mint（2026-11-11 用户现场纠正）：从**普通会话**（不是邮件
+          // 唤醒出来的那种）发信时，前三条来源全是 undefined —— 这封信于是不带
+          // 任何线程标识。用户一回信，resolveThread 的三步（References/In-Reply-To、
+          // X-DSH-Session、主题 tag）**全部落空**，只能新建会话，用户看到的正是
+          // 「我回复了，却跑到另一个会话里」。所以发信必须先把本会话登记成一条线程：
+          // 没有线程标识就现造一个，回信才有落点。
+          let tag = args.threadTag
             ? String(args.threadTag).trim().toLowerCase().replace(/^\[?dsh-?/i, '').replace(/\]$/, '')
             : (tagForSession(sessionId) ?? tagForOutgoing(parentId) ?? undefined)
+          const minted = tag === undefined && typeof sessionId === 'string' && sessionId !== ''
+          if (minted) tag = tagForNewSession(sessionId)
           const messageId = newMessageId(account.address)
           const references = messageIdsIn(parentId)
           const subject = tag ? tagSubject(args.subject, tag, liveConfig.tagPrefix) : args.subject
@@ -893,6 +1061,15 @@ const plugin = {
               references,
               tag,
             })
+            // Bind the tag to this session BEFORE recording the outgoing id, so a
+            // reply that resolves via References still lands in the session that
+            // sent the mail. `bindThread` refuses to steal an established tag, so
+            // a session that already owns one keeps it; a minted tag is fresh by
+            // construction. `move: false` on purpose — an existing binding wins.
+            // Only bind when we actually know the session: a null sessionId would
+            // write a dead binding that later blocks the real one.
+            const canBind = typeof sessionId === 'string' && sessionId !== ''
+            const bound = tag && canBind ? bindThread(tag, { sessionId, subject }) : { rebound: false }
             if (tag) recordOutgoing(messageId, tag)
             log({
               kind: 'send',
@@ -903,6 +1080,8 @@ const plugin = {
               ok: true,
               messageId,
               tag: tag ?? null,
+              tagSource: minted ? 'minted-for-session' : args.threadTag ? 'explicit' : 'existing',
+              ...(canBind ? { boundSessionId: bound.rebound ? bound.previousSessionId : sessionId } : {}),
               inReplyTo: parentId ?? null,
               sessionId: sessionId ?? null,
             })
@@ -1103,7 +1282,7 @@ const plugin = {
           const results = []
           for (const account of listAccounts()) {
             try {
-              results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig, log)) })
+              results.push({ account: account.id, ...(await pollAccount(ctx, account, liveConfig, log, hosting)) })
             } catch (error) {
               log({
                 kind: 'poll-error',
@@ -1156,6 +1335,39 @@ const plugin = {
 
     /** Handle to the running poller, so the panel can re-arm it. */
     let poller = null
+
+    /**
+     * 邮件托管实例（`hosting-host.mjs`）。
+     *
+     * 需要它存在两处：① `user-questions/request` 瀑布流（提问→邮件）；
+     * ② 轮询器把回信分流给它（回信→答案）。`null` 表示还没装。
+     */
+    let hosting = null
+
+    /**
+     * 解析一个会话的标题与 live agent。
+     *
+     * 晚到答案必须 `userQuestions.answer(agent, ...)`，而 agent 实例只能从
+     * `ctx.get('agents')` 拿 —— 会话没在跑时拿不到，这时答案先暂存，等会话
+     * 起来再补投（绝不静默丢弃用户的回答）。
+     */
+    async function smartMailSessionInfo(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return { ok: false }
+      let agent = null
+      try {
+        agent = ctx.get('agents')?.get?.(sessionId) ?? null
+      } catch {
+        agent = null
+      }
+      let title
+      try {
+        const live = ctx.get('sessions')?.get?.(sessionId)
+        title = live?.header?.title ?? live?.session?.header?.title
+      } catch {
+        title = undefined
+      }
+      return { ok: true, title: typeof title === 'string' && title !== '' ? title : undefined, agent: agent ?? undefined }
+    }
 
     /**
      * 附件清扫器（2026-11-07）：启动扫一次，之后每 6 小时一次。
@@ -1466,6 +1678,74 @@ const plugin = {
               json(res, 200, { ok: true, keepDays: liveConfig.attachmentKeepDays, ...outcome })
               return
             }
+            /* ------------------------------------------------ 邮件托管（面板） */
+            if (route === '/hosting' && req.method === 'GET') {
+              // 全局默认 + 每会话覆盖 + 活跃提问单，一次给全，面板不用来回问。
+              // sessionId 用于会话内胶囊判断「本会话是否邮件唤醒」（决定默认值）。
+              //
+              // 顺手把平台已不再接受的提问单标成 stale（2026-11-11 用户看到
+              // "4 个待答"实为历史僵尸数据）。只认平台明确否定的情况，
+              // 探测服务不可用时保持原状，绝不误标用户还能答的问题。
+              try { hosting?.sweepStale?.() } catch { /* 清理失败不影响读接口 */ }
+              const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+              const askedSession = query.get('sessionId') ?? null
+              const all = listTickets()
+              json(res, 200, {
+                ok: true,
+                hosting: liveConfig.hosting,
+                owner: pickHostingOwner(liveConfig),
+                accounts: listAccounts().map((item) => ({ id: item.id, label: item.label, address: item.address })),
+                // 只有 waiting/expired 才算"等你回信"；stale 是投不进去的历史残留。
+                active: all.filter((ticket) => ticket.status === 'waiting' || ticket.status === 'expired').map(publicTicket),
+                recent: all.slice(0, 20).map(publicTicket),
+                running: hosting?.running?.() ?? [],
+                parked: hosting?.parked?.() ?? 0,
+                ...(askedSession === null ? {} : { sessionId: askedSession, mailWoken: isMailWoken(askedSession) }),
+              })
+              return
+            }
+            if (route === '/hosting' && req.method === 'POST') {
+              // 只接受白名单里的字段：面板不该能把它改成任意形状。
+              const body = await readBody(req)
+              const before = { ...liveConfig.hosting, sessions: { ...liveConfig.hosting.sessions } }
+              const next = { ...liveConfig.hosting, sessions: { ...liveConfig.hosting.sessions } }
+              if (body.enabled !== undefined) next.enabled = Boolean(body.enabled)
+              if (body.defaultEnabled !== undefined) next.defaultEnabled = Boolean(body.defaultEnabled)
+              if (body.notifyResult !== undefined) next.notifyResult = Boolean(body.notifyResult)
+              if (body.resultMaxChars !== undefined) next.resultMaxChars = body.resultMaxChars
+              if (body.owner !== undefined) next.owner = String(body.owner)
+              if (body.account !== undefined) next.account = String(body.account)
+              if (body.waitMs !== undefined) next.waitMs = body.waitMs
+              // 单会话开/关：sessionId + sessionEnabled(true/false/null=清除覆盖)
+              if (typeof body.sessionId === 'string' && body.sessionId !== '') {
+                if (body.sessionEnabled === null || body.sessionEnabled === undefined) delete next.sessions[body.sessionId]
+                else next.sessions[body.sessionId] = Boolean(body.sessionEnabled)
+              }
+              liveConfig = normalizeConfig({ ...liveConfig, hosting: next })
+              const hostingChanged = JSON.stringify(liveConfig.hosting) !== JSON.stringify(before)
+              if (!hostingChanged) {
+                json(res, 200, { ok: true, hosting: liveConfig.hosting, persisted: true, changed: false })
+                return
+              }
+              log({ kind: 'config-change', reason: 'panel', changedFields: ['hosting'], before: { hosting: before }, after: { hosting: liveConfig.hosting } })
+              saveLastConfig(liveConfig)
+              // 写回 profile，否则这次改动活不过重启。
+              const persisted = await persistConfig(ctx, liveConfig)
+              json(res, 200, {
+                ok: true,
+                hosting: liveConfig.hosting,
+                persisted: persisted.ok,
+                ...(persisted.ok ? {} : { persistError: persisted.error }),
+              })
+              return
+            }
+            if (route === '/hosting/tickets' && req.method === 'GET') {
+              const url = new URL(req.url ?? '/', 'http://localhost')
+              const sessionId = url.searchParams.get('sessionId') ?? null
+              const list = (sessionId === null ? listTickets() : ticketsForSession(sessionId)).map(publicTicket)
+              json(res, 200, { ok: true, sessionId, count: list.length, tickets: list })
+              return
+            }
             json(res, 404, { ok: false, error: `unknown route ${req.method} ${route}` })
           } catch (cause) {
             json(res, 500, { ok: false, error: cause instanceof Error ? cause.message : String(cause) })
@@ -1475,6 +1755,20 @@ const plugin = {
     }
 
     applyTools()
+    // 邮件托管：必须在 poller 之前装好，否则启动后头几封回信到达时还没有应答者。
+    ctx.effect(() => {
+      hosting = createHosting({
+        ctx,
+        config: () => liveConfig,
+        log,
+        sessionInfo: (sessionId) => smartMailSessionInfo(sessionId),
+      })
+      const uninstall = hosting.install()
+      return () => {
+        try { uninstall() } catch { /* teardown must not throw */ }
+        hosting = null
+      }
+    }, 'smart-mail: mail hosting')
     // Pass the factory, not its result: ctx.effect calls `execute()` and keeps
     // the return value as the cleanup.
     ctx.effect(() => {
